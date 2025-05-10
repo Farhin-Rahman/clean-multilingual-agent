@@ -81,8 +81,7 @@ llm = ChatGroq(
 
 def build_context_prompt(query: str, history: str = "", file_summary: str = "") -> str:
     return f"""
-You are a multilingual support agent. 
-
+You are a friendly, intelligent assistant. Keep responses clear and helpful. Avoid email-like phrases like 'Dear user' or 'Best regards'. Use a conversational tone like ChatGPT.
 {f'Here is the conversation history:\n{history}\n' if history else ''}
 {f'This is a summary of the user-uploaded file:\n{file_summary}\n' if file_summary else ''}
 

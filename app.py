@@ -77,7 +77,7 @@ for msg in st.session_state.messages:
         st.markdown(f"<div class='chat-message {role}'><strong>{role.capitalize()}:</strong><br>{msg['content']}</div>", unsafe_allow_html=True)
 
 # Message input
-query = st.text_area("Your message:", height=100)
+query = st.text_area("Your message:", height=100, key="query")
 
 # Send button logic
 if st.button("Send"):
@@ -118,8 +118,10 @@ if st.button("Send"):
             "role": "agent",
             "content": result["response"]
         })
-
+        st.session_state.query = ""
         st.rerun()
+        st.session_state["query"] = ""
+
 
 # Clear chat button
 if st.sidebar.button("Start New Conversation"):
