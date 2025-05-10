@@ -5,6 +5,17 @@ from support_agent import run_customer_support
 import os
 from dotenv import load_dotenv
 import tempfile
+# Initialize default state
+if "query" not in st.session_state:
+    st.session_state["query"] = ""
+
+if "clear_query" not in st.session_state:
+    st.session_state["clear_query"] = False
+
+# Safely clear query if flagged
+if st.session_state.clear_query:
+    st.session_state["query"] = ""
+    st.session_state["clear_query"] = False
 
 load_dotenv()
 
@@ -118,8 +129,9 @@ if st.button("Send"):
             "role": "agent",
             "content": result["response"]
         })
-        st.session_state["query"] = ""
+        st.session_state["clear_query"] = True
         st.rerun()
+
        
 
 
