@@ -118,7 +118,7 @@ if st.button("Send"):
             "role": "agent",
             "content": result["response"]
         })
-        st.session_state.query = ""
+        st.session_state["query"] = ""
         st.rerun()
        
 
