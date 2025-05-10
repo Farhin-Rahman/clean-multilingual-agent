@@ -120,7 +120,7 @@ if st.button("Send"):
         })
         st.session_state.query = ""
         st.rerun()
-        st.session_state["query"] = ""
+       
 
 
 # Clear chat button
