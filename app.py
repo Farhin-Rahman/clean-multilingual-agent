@@ -11,6 +11,41 @@ st.set_page_config(page_title="Multilingual AI Support", layout="wide")
 # Custom CSS for better styling
 st.markdown("""
 <style>
+    /* Detect dark mode */
+    @media (prefers-color-scheme: dark) {
+        .chat-message.user {
+            background-color: #2b2b2b;
+            color: white;
+        }
+        .chat-message.assistant {
+            background-color: #1e1e1e;
+            color: white;
+        }
+        .chat-header {
+            color: #90caf9;
+        }
+        .stButton button {
+            background-color: #2196f3;
+        }
+    }
+
+    @media (prefers-color-scheme: light) {
+        .chat-message.user {
+            background-color: #f0f2f6;
+            color: black;
+        }
+        .chat-message.assistant {
+            background-color: #f8f9fa;
+            color: black;
+        }
+        .chat-header {
+            color: #4c8bf5;
+        }
+        .stButton button {
+            background-color: #4c8bf5;
+        }
+    }
+
     .chat-message {
         padding: 1.5rem;
         border-radius: 0.5rem;
@@ -18,28 +53,16 @@ st.markdown("""
         display: flex;
         flex-direction: column;
     }
-    .chat-message.user {
-        background-color: #f0f2f6;
-        border-left: 5px solid #4c8bf5;
-    }
-    .chat-message.assistant {
-        background-color: #f8f9fa;
-        border-left: 5px solid #34a853;
-    }
-    .chat-header {
-        font-weight: bold;
-        margin-bottom: 0.5rem;
-    }
+
     .stButton button {
-        background-color: #4c8bf5;
         color: white;
         border-radius: 20px;
         padding: 0.5rem 2rem;
         font-weight: bold;
     }
+
     .main-header {
         font-family: 'Helvetica Neue', sans-serif;
-        color: #4c8bf5;
         text-align: center;
     }
 </style>
