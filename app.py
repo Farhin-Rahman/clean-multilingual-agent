@@ -7,6 +7,30 @@ from dotenv import load_dotenv
 import tempfile
 from gtts import gTTS
 import base64
+import torch
+import torchaudio
+from transformers import WhisperProcessor, WhisperForConditionalGeneration
+@st.cache_resource
+def load_whisper_model():
+    model_name = "openai/whisper-small"
+    processor = WhisperProcessor.from_pretrained(model_name)
+    model = WhisperForConditionalGeneration.from_pretrained(model_name)
+    model.eval()
+    return processor, model
+
+def transcribe_with_whisper_hf(audio_path):
+    processor, model = load_whisper_model()
+    waveform, sample_rate = torchaudio.load(audio_path)
+
+    if sample_rate != 16000:
+        resampler = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=16000)
+        waveform = resampler(waveform)
+
+    input_features = processor(waveform.squeeze().numpy(), sampling_rate=16000, return_tensors="pt").input_features
+    with torch.no_grad():
+        predicted_ids = model.generate(input_features)
+
+    return processor.batch_decode(predicted_ids, skip_special_tokens=True)[0]
 
 def generate_tts_audio(text):
     import tempfile
@@ -110,6 +134,24 @@ for msg in st.session_state.messages:
 
 # Message input
 query = st.text_area("Your message:", height=100, key="query", placeholder="Ask me anything...")
+st.markdown("🎤 Or upload your voice:")
+
+audio_file = st.file_uploader("Upload audio (MP3, WAV, M4A)", type=["mp3", "wav", "m4a"])
+
+if audio_file is not None:
+    st.audio(audio_file, format="audio/mp3")
+
+    with st.spinner("Transcribing using Whisper..."):
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
+            tmp.write(audio_file.read())
+            tmp_path = tmp.name
+
+        try:
+            text = transcribe_with_whisper_hf(tmp_path)
+            st.session_state["query"] = text
+            st.success("Transcription successful! You can now edit or send it.")
+        except Exception as e:
+            st.error(f"Transcription failed: {e}")
 
 # Send button logic
 if st.button("Send"):
