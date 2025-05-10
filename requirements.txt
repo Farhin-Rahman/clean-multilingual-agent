@@ -7,3 +7,4 @@ langdetect
 python-dotenv
 protobuf>=5.26.1
 PyMuPDF
+gTTS

@@ -88,7 +88,7 @@ for msg in st.session_state.messages:
         st.markdown(f"<div class='chat-message {role}'><strong>{role.capitalize()}:</strong><br>{msg['content']}</div>", unsafe_allow_html=True)
 
 # Message input
-query = st.text_area("Your message:", height=100, key="query")
+query = st.text_area("Your message:", height=100, key="query", placeholder="Ask me anything...")
 
 # Send button logic
 if st.button("Send"):
