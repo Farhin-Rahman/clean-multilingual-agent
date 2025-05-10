@@ -9,13 +9,15 @@ from gtts import gTTS
 import base64
 
 def generate_tts_audio(text):
+    import tempfile
     tts = gTTS(text)
-    tts.save("response.mp3")
-    with open("response.mp3", "rb") as f:
-        audio_bytes = f.read()
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
+        tts.save(tmp.name)
+        with open(tmp.name, "rb") as f:
+            audio_bytes = f.read()
     b64 = base64.b64encode(audio_bytes).decode()
     audio_html = f"""
-    <audio autoplay controls>
+    <audio controls>
     <source src="data:audio/mp3;base64,{b64}" type="audio/mp3">
     </audio>
     """
