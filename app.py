@@ -5,6 +5,22 @@ from support_agent import run_customer_support
 import os
 from dotenv import load_dotenv
 import tempfile
+from gtts import gTTS
+import base64
+
+def generate_tts_audio(text):
+    tts = gTTS(text)
+    tts.save("response.mp3")
+    with open("response.mp3", "rb") as f:
+        audio_bytes = f.read()
+    b64 = base64.b64encode(audio_bytes).decode()
+    audio_html = f"""
+    <audio autoplay controls>
+    <source src="data:audio/mp3;base64,{b64}" type="audio/mp3">
+    </audio>
+    """
+    return audio_html
+
 # Initialize default state
 if "query" not in st.session_state:
     st.session_state["query"] = ""
@@ -86,6 +102,9 @@ for msg in st.session_state.messages:
     role = "user" if msg["role"] == "user" else "agent"
     with st.container():
         st.markdown(f"<div class='chat-message {role}'><strong>{role.capitalize()}:</strong><br>{msg['content']}</div>", unsafe_allow_html=True)
+        if role == "agent":
+            st.markdown(generate_tts_audio(msg["content"]), unsafe_allow_html=True)
+
 
 # Message input
 query = st.text_area("Your message:", height=100, key="query", placeholder="Ask me anything...")
