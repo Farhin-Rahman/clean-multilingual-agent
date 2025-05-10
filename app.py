@@ -1,85 +1,57 @@
+# Updated app.py with file upload and flowing chat context
+
 import streamlit as st
 from support_agent import run_customer_support
 import os
 from dotenv import load_dotenv
+import tempfile
 
 load_dotenv()
 
-# Page setup with improved styling
 st.set_page_config(page_title="Multilingual AI Support", layout="wide")
 
-# Custom CSS for better styling
+# Custom CSS for light/dark adaptive UI
 st.markdown("""
 <style>
-    /* Detect dark mode */
-    @media (prefers-color-scheme: dark) {
-        .chat-message.user {
-            background-color: #2b2b2b;
-            color: white;
-        }
-        .chat-message.assistant {
-            background-color: #1e1e1e;
-            color: white;
-        }
-        .chat-header {
-            color: #90caf9;
-        }
-        .stButton button {
-            background-color: #2196f3;
-        }
-    }
-
-    @media (prefers-color-scheme: light) {
-        .chat-message.user {
-            background-color: #f0f2f6;
-            color: black;
-        }
-        .chat-message.assistant {
-            background-color: #f8f9fa;
-            color: black;
-        }
-        .chat-header {
-            color: #4c8bf5;
-        }
-        .stButton button {
-            background-color: #4c8bf5;
-        }
-    }
-
     .chat-message {
-        padding: 1.5rem;
+        padding: 1.2rem;
         border-radius: 0.5rem;
         margin-bottom: 1rem;
         display: flex;
         flex-direction: column;
     }
-
-    .stButton button {
-        color: white;
-        border-radius: 20px;
-        padding: 0.5rem 2rem;
-        font-weight: bold;
+    .chat-message.user {
+        background-color: #e8f0fe;
+        color: black;
+        border-left: 4px solid #4285f4;
     }
-
-    .main-header {
-        font-family: 'Helvetica Neue', sans-serif;
-        text-align: center;
+    .chat-message.agent {
+        background-color: #f1f3f4;
+        color: black;
+        border-left: 4px solid #34a853;
+    }
+    @media (prefers-color-scheme: dark) {
+        .chat-message.user {
+            background-color: #2b2b2b;
+            color: white;
+        }
+        .chat-message.agent {
+            background-color: #1e1e1e;
+            color: white;
+        }
     }
 </style>
 """, unsafe_allow_html=True)
 
-# App title
-st.markdown("<h1 class='main-header'>🌍 Multilingual AI Support Center</h1>", unsafe_allow_html=True)
-st.markdown("<p style='text-align: center; margin-bottom: 2rem;'>Get help in your preferred language. Our AI understands and responds in multiple languages.</p>", unsafe_allow_html=True)
+st.markdown("<h1 style='text-align:center;'>🌍 Multilingual AI Support</h1>", unsafe_allow_html=True)
 
-# Settings in sidebar
+# Sidebar settings
 with st.sidebar:
-    st.title("Settings")
+    st.header("Settings")
     display_language = st.selectbox(
         "Force response language:",
         ["Auto (detect)", "English", "Spanish", "French", "German", "Bengali", "Italian", "Portuguese"]
     )
-    
     language_mapping = {
         "Auto (detect)": None,
         "English": "en",
@@ -90,86 +62,66 @@ with st.sidebar:
         "Italian": "it",
         "Portuguese": "pt"
     }
-    
-    with st.expander("About this app"):
-        st.markdown("""
-        This support agent can:
-        - Automatically detect your language
-        - Categorize your issue
-        - Analyze sentiment
-        - Provide helpful responses in your language
-        - Handle follow-up questions
-        """)
+    st.markdown("---")
+    st.markdown("Upload a file (PDF, TXT)")
+    uploaded_file = st.file_uploader("Attach a file", type=["pdf", "txt"])
 
-# Initialize chat history
+# Initialize session
 if "messages" not in st.session_state:
     st.session_state.messages = []
-    
-# Display chat history
-for i, message in enumerate(st.session_state.messages):
-    if message["role"] == "user":
-        with st.container():
-            st.markdown(f"<div class='chat-message user'><div class='chat-header'>You:</div>{message['content']}</div>", unsafe_allow_html=True)
-            if "image" in message:
-                st.image(message["image"], caption="Attached image")
-    else:
-        with st.container():
-            st.markdown(f"<div class='chat-message assistant'><div class='chat-header'>Support Agent:</div>{message['content']}</div>", unsafe_allow_html=True)
-            if i > 0 and message.get("analysis"):
-                with st.expander("View Analysis"):
-                    st.write(f"**Category:** {message['analysis']['category']}")
-                    st.write(f"**Sentiment:** {message['analysis']['sentiment']}")
-                    st.write(f"**Language:** {message['analysis']['language']}")
 
-# File upload
-uploaded_file = st.file_uploader("📎 Attach a file (optional)", type=["png", "jpg", "jpeg", "pdf", "txt"])
+# Display message history
+for msg in st.session_state.messages:
+    role = "user" if msg["role"] == "user" else "agent"
+    with st.container():
+        st.markdown(f"<div class='chat-message {role}'><strong>{role.capitalize()}:</strong><br>{msg['content']}</div>", unsafe_allow_html=True)
 
 # Message input
-query = st.text_area("Type your message:", height=100)
+query = st.text_area("Your message:", height=100)
 
-# Send button
-if st.button("Send Message"):
-    if query:
-        # Add user message to chat history
-        user_message = {"role": "user", "content": query}
-        if uploaded_file:
-            # If it's an image, store it for display
-            if uploaded_file.type.startswith('image'):
-                user_message["image"] = uploaded_file
-                
-            # Add file info to the query
-            query += f"\n[Attached file: {uploaded_file.name}]"
-        
-        st.session_state.messages.append(user_message)
-        
-        # Get selected language
-        selected_lang = language_mapping[display_language]
-        
-        # Process with support agent
-        with st.spinner("Processing your query..."):
-            try:
-                result = run_customer_support(query, force_language=selected_lang)
-                
-                # Add AI response to chat history
-                st.session_state.messages.append({
-                    "role": "assistant", 
-                    "content": result["response"],
-                    "analysis": {
-                        "category": result["category"],
-                        "sentiment": result["sentiment"],
-                        "language": result["original_language"]
-                    }
-                })
-                
-                # Force UI refresh
-                st.rerun()
-                
-            except Exception as e:
-                st.error(f"An error occurred: {str(e)}")
+# Send button logic
+if st.button("Send"):
+    if not query.strip():
+        st.warning("Please enter a message.")
     else:
-        st.warning("Please enter a message before sending.")
+        # Store file temporarily if uploaded
+        file_path = None
+        if uploaded_file:
+            suffix = ".pdf" if uploaded_file.type == "application/pdf" else ".txt"
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                tmp.write(uploaded_file.read())
+                file_path = tmp.name
+
+        # Append user message
+        st.session_state.messages.append({"role": "user", "content": query})
+
+        # Prepare chat history in model format
+        chat_history = []
+        for i in range(0, len(st.session_state.messages) - 1, 2):
+            if i + 1 < len(st.session_state.messages):
+                chat_history.append({
+                    "user": st.session_state.messages[i]["content"],
+                    "agent": st.session_state.messages[i+1]["content"]
+                })
+
+        # Run support function
+        with st.spinner("Thinking..."):
+            result = run_customer_support(
+                query=query,
+                force_language=language_mapping[display_language],
+                chat_history=chat_history,
+                file_path=file_path
+            )
+
+        # Append assistant message
+        st.session_state.messages.append({
+            "role": "agent",
+            "content": result["response"]
+        })
+
+        st.rerun()
 
 # Clear chat button
 if st.sidebar.button("Start New Conversation"):
-    st.session_state.messages = []
+    st.session_state.clear()
     st.rerun()
