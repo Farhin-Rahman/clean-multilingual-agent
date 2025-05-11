@@ -47,13 +47,15 @@ def generate_tts_audio(text):
     tts = gTTS(text)
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
         tts.save(tmp.name)
-        audio_bytes = tmp.read()
+        tmp.seek(0)  # go back to the start of the file
+        audio_bytes = tmp.read()  # this was the problem!
     b64 = base64.b64encode(audio_bytes).decode()
     return f"""
         <audio controls>
         <source src="data:audio/mp3;base64,{b64}" type="audio/mp3">
         </audio>
     """
+
 
 # Session init
 if "query" not in st.session_state:
