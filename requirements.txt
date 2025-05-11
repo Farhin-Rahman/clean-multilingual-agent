@@ -10,5 +10,6 @@ PyMuPDF
 gtts
 torchaudio
 sentencepiece
-pydub
 torch
+streamlit-webrtc
+av
