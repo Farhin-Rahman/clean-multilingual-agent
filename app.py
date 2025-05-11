@@ -5,6 +5,7 @@ import tempfile
 import os
 import base64
 from gtts import gTTS
+import io
 from pydub import AudioSegment
 from streamlit_mic_recorder import mic_recorder
 import numpy as np
