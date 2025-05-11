@@ -1,54 +1,40 @@
 import streamlit as st
 from support_agent import run_customer_support
 from dotenv import load_dotenv
-import tempfile
 import os
 import base64
 from gtts import gTTS
-import io
+import tempfile
 from streamlit_mic_recorder import mic_recorder
-import torch
-from transformers import WhisperProcessor, WhisperForConditionalGeneration
+import whisper
 
-# Load .env
+# Load environment variables
 load_dotenv()
 st.set_page_config(page_title="Multilingual AI Support", layout="wide")
 
-# Cached Whisper loader
+# Whisper model loading (only once)
 @st.cache_resource
 def load_whisper_model():
-    processor = WhisperProcessor.from_pretrained("openai/whisper-small")
-    model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-small")
-    model.eval()
-    return processor, model
+    return whisper.load_model("base")
 
-# Convert and transcribe mic audio
+# STT: Transcribe mic audio using Whisper
 def transcribe_audio(audio_bytes, sample_rate):
-    import torchaudio
-    import io
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+        tmp.write(audio_bytes)
+        tmp.flush()
+        tmp_path = tmp.name
 
-    # Load audio directly from memory using torchaudio
-    waveform, sr = torchaudio.load(io.BytesIO(audio_bytes))
-    if sr != 16000:
-        resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=16000)
-        waveform = resampler(waveform)
+    model = load_whisper_model()
+    result = model.transcribe(tmp_path)
+    return result["text"]
 
-    processor, model = load_whisper_model()
-    inputs = processor(waveform.squeeze().numpy(), sampling_rate=16000, return_tensors="pt").input_features
-
-    with torch.no_grad():
-        ids = model.generate(inputs)
-
-    return processor.batch_decode(ids, skip_special_tokens=True)[0]
-
-
-# Text-to-speech generator
+# TTS: Convert text to audio
 def generate_tts_audio(text):
     tts = gTTS(text)
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
         tts.save(tmp.name)
-        tmp.seek(0)  # go back to the start of the file
-        audio_bytes = tmp.read()  # this was the problem!
+        tmp.seek(0)
+        audio_bytes = tmp.read()
     b64 = base64.b64encode(audio_bytes).decode()
     return f"""
         <audio controls>
@@ -56,8 +42,7 @@ def generate_tts_audio(text):
         </audio>
     """
 
-
-# Session init
+# Session state
 if "query" not in st.session_state:
     st.session_state.query = ""
 if "clear_query" not in st.session_state:
@@ -68,7 +53,7 @@ if st.session_state.clear_query:
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# Sidebar
+# Sidebar settings
 with st.sidebar:
     st.header("Settings")
     display_language = st.selectbox("Force response language:", [
@@ -112,7 +97,7 @@ if audio:
 # Text input
 query = st.text_area("Your message:", value=st.session_state.query, height=100, key="query", placeholder="Ask me anything...")
 
-# Send
+# Submit
 if st.button("Send"):
     if query.strip():
         st.session_state.messages.append({"role": "user", "content": query})
@@ -128,7 +113,7 @@ if st.button("Send"):
             if i + 1 < len(st.session_state.messages):
                 chat_history.append({
                     "user": st.session_state.messages[i]["content"],
-                    "agent": st.session_state.messages[i+1]["content"]
+                    "agent": st.session_state.messages[i + 1]["content"]
                 })
 
         with st.spinner("Thinking..."):
