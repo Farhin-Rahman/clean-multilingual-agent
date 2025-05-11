@@ -2,7 +2,7 @@ streamlit
 streamlit-mic-recorder
 transformers
 torch
-whisper
+faster-whisper
 gtts
 python-dotenv
 langdetect

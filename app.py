@@ -6,7 +6,7 @@ import base64
 from gtts import gTTS
 import tempfile
 from streamlit_mic_recorder import mic_recorder
-import whisper
+from faster_whisper import WhisperModel
 
 # Load environment variables
 load_dotenv()
@@ -15,9 +15,8 @@ st.set_page_config(page_title="Multilingual AI Support", layout="wide")
 # Whisper model loading (only once)
 @st.cache_resource
 def load_whisper_model():
-    return whisper.load_model("base")
+    return WhisperModel("base", compute_type="auto")
 
-# STT: Transcribe mic audio using Whisper
 def transcribe_audio(audio_bytes, sample_rate):
     with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
         tmp.write(audio_bytes)
@@ -25,10 +24,9 @@ def transcribe_audio(audio_bytes, sample_rate):
         tmp_path = tmp.name
 
     model = load_whisper_model()
-    result = model.transcribe(tmp_path)
-    return result["text"]
-
-# TTS: Convert text to audio
+    segments, _ = model.transcribe(tmp_path)
+    transcription = "".join([segment.text for segment in segments])
+    return transcription.strip()
 def generate_tts_audio(text):
     tts = gTTS(text)
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
@@ -41,6 +39,7 @@ def generate_tts_audio(text):
         <source src="data:audio/mp3;base64,{b64}" type="audio/mp3">
         </audio>
     """
+
 
 # Session state
 if "query" not in st.session_state:
