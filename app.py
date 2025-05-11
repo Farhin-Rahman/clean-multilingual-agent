@@ -6,9 +6,7 @@ import os
 import base64
 from gtts import gTTS
 import io
-from pydub import AudioSegment
 from streamlit_mic_recorder import mic_recorder
-import numpy as np
 import torch
 from transformers import WhisperProcessor, WhisperForConditionalGeneration
 
@@ -26,15 +24,23 @@ def load_whisper_model():
 
 # Convert and transcribe mic audio
 def transcribe_audio(audio_bytes, sample_rate):
-    audio = AudioSegment.from_file(io.BytesIO(audio_bytes), format="wav")
-    audio = audio.set_frame_rate(16000).set_channels(1)
-    samples = np.array(audio.get_array_of_samples()).astype(np.float32) / 32768.0
+    import torchaudio
+    import io
+
+    # Load audio directly from memory using torchaudio
+    waveform, sr = torchaudio.load(io.BytesIO(audio_bytes))
+    if sr != 16000:
+        resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=16000)
+        waveform = resampler(waveform)
 
     processor, model = load_whisper_model()
-    inputs = processor(samples, sampling_rate=16000, return_tensors="pt").input_features
+    inputs = processor(waveform.squeeze().numpy(), sampling_rate=16000, return_tensors="pt").input_features
+
     with torch.no_grad():
         ids = model.generate(inputs)
+
     return processor.batch_decode(ids, skip_special_tokens=True)[0]
+
 
 # Text-to-speech generator
 def generate_tts_audio(text):
