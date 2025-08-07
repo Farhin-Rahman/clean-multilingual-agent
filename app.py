@@ -27,6 +27,7 @@ def transcribe_audio(audio_bytes, sample_rate):
     segments, _ = model.transcribe(tmp_path)
     transcription = "".join([segment.text for segment in segments])
     return transcription.strip()
+
 def generate_tts_audio(text):
     tts = gTTS(text)
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
@@ -40,6 +41,38 @@ def generate_tts_audio(text):
         </audio>
     """
 
+# Add financial demo functionality
+def show_financial_demo():
+    st.sidebar.markdown("---")
+    st.sidebar.header("🏦 Financial Advisory Demo")
+    st.sidebar.markdown("*Demonstrates multi-agent AI system*")
+    
+    demo_enabled = st.sidebar.checkbox("Enable Financial Mode", value=False)
+    
+    if demo_enabled:
+        st.sidebar.subheader("Investment Preferences")
+        risk_level = st.sidebar.selectbox("Risk Tolerance", ["Low", "Medium", "High"])
+        sectors = st.sidebar.multiselect("Preferred Sectors", 
+            ["Technology", "Healthcare", "Finance", "Energy"], 
+            default=["Technology"])
+        investment_amount = st.sidebar.number_input("Investment Amount ($)", 
+            min_value=1000, max_value=100000, value=25000)
+        
+        st.sidebar.markdown("**Try these example queries:**")
+        example_queries = [
+            "Find safe technology stocks for conservative investors",
+            "Recommend high-growth companies under $100 per share", 
+            "What are the best healthcare investments for medium risk tolerance?",
+            "Show me companies with low P/E ratios in the finance sector"
+        ]
+        
+        for i, example in enumerate(example_queries, 1):
+            if st.sidebar.button(f"Example {i}", key=f"ex_{i}"):
+                st.session_state.query = example
+                st.rerun()
+        
+        return True
+    return False
 
 # Session state
 if "query" not in st.session_state:
@@ -59,6 +92,10 @@ with st.sidebar:
         "Auto (detect)", "English", "Spanish", "French", "German", "Bengali", "Italian", "Portuguese"
     ])
     uploaded_file = st.file_uploader("Upload a file (PDF, TXT)", type=["pdf", "txt"])
+    
+    # Add financial demo
+    is_financial_mode = show_financial_demo()
+    
     language_mapping = {
         "Auto (detect)": None,
         "English": "en",
@@ -75,6 +112,16 @@ with st.sidebar:
 
 # Header
 st.markdown("<h1 style='text-align:center;'>🌍 Multilingual AI Support</h1>", unsafe_allow_html=True)
+
+# Demo indicator
+if 'financial_mode' not in st.session_state:
+    st.session_state.financial_mode = False
+
+# Show demo status
+if any('invest' in msg.get('content', '').lower() or 'stock' in msg.get('content', '').lower() 
+       or 'company' in msg.get('content', '').lower() or 'finance' in msg.get('content', '').lower()
+       for msg in st.session_state.messages):
+    st.info("🤖 **Multi-Agent Financial System Active** - Demonstrating SQL generation, data integration, and investment recommendations")
 
 # Chat display
 for msg in st.session_state.messages:
@@ -94,7 +141,7 @@ if audio:
     st.success("Transcription ready!")
 
 # Text input
-query = st.text_area("Your message:", value=st.session_state.query, height=100, key="query", placeholder="Ask me anything...")
+query = st.text_area("Your message:", value=st.session_state.query, height=100, key="query", placeholder="Ask me anything... Try: 'Find safe technology stocks for conservative investors'")
 
 # Submit
 if st.button("Send"):
@@ -115,8 +162,12 @@ if st.button("Send"):
                     "agent": st.session_state.messages[i + 1]["content"]
                 })
 
-        with st.spinner("Thinking..."):
+        with st.spinner("🤖 Multi-agent system working..."):
             result = run_customer_support(query, language_mapping[display_language], chat_history, file_path)
         st.session_state.messages.append({"role": "agent", "content": result["response"]})
         st.session_state.clear_query = True
         st.rerun()
+
+# Footer with demo information
+st.markdown("---")
+st.markdown("**Demo Features:** Multi-agent orchestration • SQL query generation • Data integration • Investment recommendations • Business automation")
