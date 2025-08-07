@@ -10,6 +10,9 @@ import fitz  # PyMuPDF
 import os
 import json
 import re
+import yfinance as yf
+import requests
+import pandas as pd
 
 load_dotenv()
 
@@ -21,14 +24,77 @@ SUPPORTED_LANGUAGES = {
     "it": "Italian", "pt": "Portuguese", "en": "English"
 }
 
-# Sample financial data for demo
-SAMPLE_COMPANIES = [
-    {"name": "TechCorp", "sector": "Technology", "market_cap": 50000, "pe_ratio": 15, "price": 120, "risk": "Medium"},
-    {"name": "HealthPlus", "sector": "Healthcare", "market_cap": 30000, "pe_ratio": 18, "price": 85, "risk": "Low"},
-    {"name": "GreenEnergy", "sector": "Energy", "market_cap": 25000, "pe_ratio": 12, "price": 45, "risk": "High"},
-    {"name": "FinanceFirst", "sector": "Finance", "market_cap": 40000, "pe_ratio": 14, "price": 95, "risk": "Low"},
-    {"name": "InnovateTech", "sector": "Technology", "market_cap": 60000, "pe_ratio": 22, "price": 150, "risk": "High"}
-]
+# REAL DATA FUNCTIONS
+def get_real_stock_data(symbols=['AAPL', 'MSFT', 'GOOGL', 'JNJ', 'JPM', 'PFE', 'XOM', 'NVDA', 'TSLA', 'V']):
+    """Get real stock data from Yahoo Finance"""
+    real_companies = []
+    
+    for symbol in symbols:
+        try:
+            stock = yf.Ticker(symbol)
+            info = stock.info
+            hist = stock.history(period="1d")
+            
+            if not hist.empty and info:
+                current_price = round(hist['Close'].iloc[-1], 2)
+                market_cap = info.get('marketCap', 0)
+                pe_ratio = info.get('trailingPE', 0)
+                sector = info.get('sector', 'Unknown')
+                name = info.get('longName', symbol)
+                
+                # Simple risk calculation based on beta
+                beta = info.get('beta', 1.0)
+                if beta and beta < 0.8:
+                    risk = "Low"
+                elif beta and beta > 1.2:
+                    risk = "High" 
+                else:
+                    risk = "Medium"
+                
+                real_companies.append({
+                    "name": name,
+                    "symbol": symbol,
+                    "sector": sector,
+                    "market_cap": market_cap,
+                    "pe_ratio": round(pe_ratio, 2) if pe_ratio else 0,
+                    "price": current_price,
+                    "risk": risk,
+                    "beta": beta if beta else 1.0
+                })
+        except Exception as e:
+            print(f"Error fetching {symbol}: {e}")
+            continue
+    
+    return real_companies
+
+def get_sector_stocks(sector_query):
+    """Get stocks based on sector"""
+    sector_symbols = {
+        'technology': ['AAPL', 'MSFT', 'GOOGL', 'NVDA', 'META', 'TSLA'],
+        'healthcare': ['JNJ', 'PFE', 'UNH', 'ABBV', 'MRK', 'TMO'],
+        'finance': ['JPM', 'BAC', 'WFC', 'GS', 'MS', 'C'],
+        'energy': ['XOM', 'CVX', 'COP', 'EOG', 'SLB'],
+        'consumer': ['AMZN', 'WMT', 'PG', 'KO', 'PEP']
+    }
+    
+    query_lower = sector_query.lower()
+    symbols = []
+    
+    if any(word in query_lower for word in ['tech', 'technology', 'software']):
+        symbols = sector_symbols['technology']
+    elif any(word in query_lower for word in ['health', 'healthcare', 'medical', 'pharma']):
+        symbols = sector_symbols['healthcare']  
+    elif any(word in query_lower for word in ['finance', 'bank', 'financial']):
+        symbols = sector_symbols['finance']
+    elif any(word in query_lower for word in ['energy', 'oil', 'gas']):
+        symbols = sector_symbols['energy']
+    elif any(word in query_lower for word in ['consumer', 'retail']):
+        symbols = sector_symbols['consumer']
+    else:
+        # Default mix
+        symbols = ['AAPL', 'MSFT', 'JNJ', 'JPM', 'XOM']
+    
+    return get_real_stock_data(symbols)
 
 @lru_cache(maxsize=20)
 def get_translator(source_lang, target_lang):
@@ -94,9 +160,9 @@ def generate_sql_agent(state: FinancialAgentState):
     Query: "{query}"
     
     Available database schema:
-    - companies (id, name, sector, market_cap, pe_ratio, price, risk_level)
+    - companies (symbol, name, sector, market_cap, pe_ratio, price, risk_level, beta)
     - user_preferences (user_id, risk_tolerance, preferred_sectors, investment_amount)
-    - financial_metrics (company_id, revenue, profit_margin, debt_ratio, roe)
+    - financial_metrics (symbol, revenue, profit_margin, debt_ratio, roe, dividend_yield)
     
     Generate 2-3 relevant SQL queries that would help answer this query:
     """
@@ -106,7 +172,7 @@ def generate_sql_agent(state: FinancialAgentState):
     # Extract SQL queries from response
     sql_queries = re.findall(r'```sql\n(.*?)\n```', response.content, re.DOTALL)
     if not sql_queries:
-        sql_queries = [f"SELECT * FROM companies WHERE sector LIKE '%tech%' AND pe_ratio < 20;"]
+        sql_queries = [f"SELECT * FROM companies WHERE sector LIKE '%technology%' AND pe_ratio < 25 ORDER BY market_cap DESC;"]
     
     state["sql_queries"] = sql_queries
     return state
@@ -115,27 +181,49 @@ def generate_sql_agent(state: FinancialAgentState):
 def data_integration_agent(state: FinancialAgentState):
     query = state["query"]
     
-    # Simulate database query results with sample data
+    # Get real data based on query
+    all_companies = get_sector_stocks(query)
     relevant_companies = []
     
-    # Simple keyword matching for demo
     query_lower = query.lower()
-    for company in SAMPLE_COMPANIES:
-        if (any(keyword in query_lower for keyword in ['tech', 'technology']) and company['sector'] == 'Technology') or \
-           (any(keyword in query_lower for keyword in ['health', 'healthcare']) and company['sector'] == 'Healthcare') or \
-           (any(keyword in query_lower for keyword in ['safe', 'low risk', 'stable']) and company['risk'] == 'Low') or \
-           len(relevant_companies) < 3:
-            relevant_companies.append(company)
+    
+    # Risk-based filtering
+    if any(word in query_lower for word in ['safe', 'low risk', 'stable', 'conservative']):
+        relevant_companies = [c for c in all_companies if c['risk'] == 'Low']
+    elif any(word in query_lower for word in ['growth', 'high return', 'aggressive']):
+        relevant_companies = [c for c in all_companies if c['risk'] == 'High']
+    else:
+        relevant_companies = all_companies
+    
+    # Price filtering
+    if any(word in query_lower for word in ['under $100', 'below 100', 'cheap']):
+        relevant_companies = [c for c in relevant_companies if c['price'] < 100]
+    elif any(word in query_lower for word in ['under $50', 'below 50']):
+        relevant_companies = [c for c in relevant_companies if c['price'] < 50]
+    
+    # P/E ratio filtering
+    if any(word in query_lower for word in ['low pe', 'undervalued']):
+        relevant_companies = [c for c in relevant_companies if c['pe_ratio'] and c['pe_ratio'] < 20]
+    
+    # If no specific filtering, return top companies by market cap
+    if not relevant_companies:
+        relevant_companies = sorted(all_companies, key=lambda x: x.get('market_cap', 0), reverse=True)
     
     state["company_data"] = relevant_companies[:5]
     
     # Market analysis integration
     analysis_prompt = f"""
-    Based on the following company data: {relevant_companies}
+    Based on the following real company data: {[{
+        'name': c['name'], 
+        'sector': c['sector'], 
+        'market_cap': f"${c['market_cap']/1000000000:.1f}B" if c['market_cap'] > 1000000000 else f"${c['market_cap']/1000000:.1f}M",
+        'pe_ratio': c['pe_ratio'],
+        'price': c['price']
+    } for c in relevant_companies[:3]]}
     
     Provide a brief market analysis focusing on:
-    1. Sector trends
-    2. Risk assessment
+    1. Current sector trends
+    2. Risk assessment based on real metrics
     3. Growth potential
     
     Keep it concise (2-3 sentences):
@@ -155,28 +243,44 @@ def recommendation_agent(state: FinancialAgentState):
     rec_prompt = f"""
     User Query: "{query}"
     Market Analysis: {analysis}
-    Available Companies: {json.dumps(companies, indent=2)}
     
-    Generate 3 personalized investment recommendations. For each recommendation, provide:
-    1. Company name and why it fits the user's needs
-    2. Risk level and expected returns
+    Real Company Data:
+    {json.dumps([{
+        'name': c['name'],
+        'symbol': c['symbol'], 
+        'sector': c['sector'],
+        'market_cap': c['market_cap'],
+        'pe_ratio': c['pe_ratio'],
+        'current_price': c['price'],
+        'risk_level': c['risk'],
+        'beta': c['beta']
+    } for c in companies], indent=2)}
+    
+    Generate 3 personalized investment recommendations using REAL data. For each:
+    1. Company name (symbol) and why it fits user needs
+    2. Risk level and expected returns based on real metrics
     3. Recommended allocation percentage
-    4. Key financial metrics
+    4. Key financial metrics (real P/E, market cap, price)
+    5. Current market position
     
-    Format as a clear, actionable response:
+    Format as a clear, actionable response with real financial data:
     """
     
     response = llm.invoke([{"role": "user", "content": rec_prompt}])
     
-    # Parse recommendations (simplified for demo)
+    # Parse recommendations with real data
     recommendations = []
     for i, company in enumerate(companies[:3]):
         recommendations.append({
             "company": company["name"],
+            "symbol": company["symbol"],
             "sector": company["sector"],
-            "allocation": f"{30-i*5}%",
+            "allocation": f"{40-i*10}%",
             "risk": company["risk"],
-            "rationale": f"Strong fundamentals with P/E ratio of {company['pe_ratio']}"
+            "price": company["price"],
+            "market_cap": company["market_cap"],
+            "pe_ratio": company["pe_ratio"],
+            "rationale": f"Real P/E ratio of {company['pe_ratio']}, Market cap: ${company['market_cap']/1000000000:.1f}B"
         })
     
     state["recommendations"] = recommendations
@@ -202,7 +306,7 @@ def create_financial_workflow():
     return workflow.compile()
 
 def is_financial_query(query: str) -> bool:
-    financial_keywords = ['invest', 'stock', 'portfolio', 'finance', 'company', 'market', 'buy', 'sell', 'recommendation', 'risk', 'return']
+    financial_keywords = ['invest', 'stock', 'portfolio', 'finance', 'company', 'market', 'buy', 'sell', 'recommendation', 'risk', 'return', 'shares']
     return any(keyword in query.lower() for keyword in financial_keywords)
 
 def run_customer_support(query: str,
@@ -230,15 +334,18 @@ def run_customer_support(query: str,
         result = workflow.invoke(initial_state)
         response = result["final_response"]
         
-        # Add technical details for demo
-        demo_info = f"\n\n🔧 **Technical Demo Info:**\n"
+        # Add technical details for demo with REAL data
+        demo_info = f"\n\n🔧 **Live Technical Demo - Real Market Data:**\n"
         demo_info += f"**Generated SQL Queries:** {len(result['sql_queries'])} queries\n"
-        demo_info += f"**Data Sources Integrated:** Company DB, Market Data, Financial Metrics\n"
-        demo_info += f"**Companies Analyzed:** {len(result['company_data'])}\n"
+        demo_info += f"**Live Data Sources:** Yahoo Finance API, Real-time Stock Data\n"
+        demo_info += f"**Companies Analyzed:** {len(result['company_data'])} (Live Market Data)\n"
         demo_info += f"**Recommendations Generated:** {len(result['recommendations'])}\n\n"
         
+        demo_info += "**Real Stock Recommendations:**\n"
         for i, rec in enumerate(result['recommendations'], 1):
-            demo_info += f"{i}. **{rec['company']}** ({rec['sector']}) - {rec['allocation']} allocation, {rec['risk']} risk\n"
+            demo_info += f"{i}. **{rec['company']}** ({rec['symbol']}) - ${rec['price']}/share\n"
+            demo_info += f"   • {rec['allocation']} allocation, {rec['risk']} risk\n"
+            demo_info += f"   • Market Cap: ${rec['market_cap']/1000000000:.1f}B, P/E: {rec['pe_ratio']}\n\n"
         
         response += demo_info
         

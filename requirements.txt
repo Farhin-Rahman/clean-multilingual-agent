@@ -11,6 +11,10 @@ langchain-groq
 langgraph
 PyMuPDF
 sentencepiece
+yfinance
+requests
+pandas
+alpha-vantage
 
 
 
