@@ -1,21 +1,31 @@
+# Main Streamlit and UI
 streamlit
 streamlit-mic-recorder
-transformers
-torch
-faster-whisper
 gtts
-python-dotenv
-langdetect
+
+# AI and Machine Learning Core
+torch
+transformers
+faster-whisper
+sentencepiece
+
+# LangChain and LangGraph Ecosystem
 langchain-core
 langchain-groq
 langgraph
-PyMuPDF
-sentencepiece
+langchain-community
+
+# Data and Financial APIs
 yfinance
 requests
 pandas
-alpha-vantage
 finnhub-python
 fredapi
+
+# Utility and Document Handling
+python-dotenv
+langdetect
+PyMuPDF
+duckduckgo-search
 lxml
 html5lib

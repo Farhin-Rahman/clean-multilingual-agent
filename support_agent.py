@@ -22,6 +22,7 @@ import logging
 import hashlib
 import time
 from contextlib import contextmanager
+from duckduckgo_search import DDGS
 
 load_dotenv()
 
@@ -685,56 +686,60 @@ def generate_sql_agent(state: FinancialAgentState):
     return state
 
 def data_integration_agent(state: FinancialAgentState):
-    """Data Integration Agent"""
+    """Data Integration Agent - Now executes SQL queries against the local DB."""
     query = state["query"]
+    sql_queries = state.get("sql_queries", [])
     
-    all_companies = get_sector_stocks(query)
-    relevant_companies = []
-    
-    query_lower = query.lower()
-    
-    if any(word in query_lower for word in ['safe', 'low risk', 'stable', 'conservative']):
-        relevant_companies = [c for c in all_companies if c['risk'] == 'Low']
-    elif any(word in query_lower for word in ['growth', 'high return', 'aggressive']):
-        relevant_companies = [c for c in all_companies if c['risk'] == 'High']
+    db_path = "secure_portfolios.db"
+    all_results = []
+
+    try:
+        with sqlite3.connect(db_path) as conn:
+            for sql_query in sql_queries:
+                try:
+                    # Sanitize for safety, even though it's AI-generated
+                    safe_query = SecurityManager.sanitize_sql_input(sql_query)
+                    # Use pandas to easily get a DataFrame
+                    df = pd.read_sql_query(safe_query, conn)
+                    if not df.empty:
+                        all_results.append(df)
+                except Exception as e:
+                    logger.error(f"SQL execution failed for query '{sql_query}': {e}")
+    except Exception as e:
+        logger.error(f"Database connection failed: {e}")
+
+    # Process results
+    if all_results:
+        # Simple strategy: merge results and drop duplicates
+        final_df = pd.concat(all_results).drop_duplicates(subset=['symbol']).reset_index(drop=True)
+        # Convert DataFrame to the list of dicts format the next agent expects
+        company_data = final_df.to_dict('records')
     else:
-        relevant_companies = all_companies
-    
-    if any(word in query_lower for word in ['under $100', 'below 100', 'cheap']):
-        relevant_companies = [c for c in relevant_companies if c['price'] < 100]
-    elif any(word in query_lower for word in ['under $50', 'below 50']):
-        relevant_companies = [c for c in relevant_companies if c['price'] < 50]
-    
-    if any(word in query_lower for word in ['low pe', 'undervalued']):
-        relevant_companies = [c for c in relevant_companies if c['pe_ratio'] and c['pe_ratio'] < 20]
-    
-    if not relevant_companies:
-        relevant_companies = sorted(all_companies, key=lambda x: x.get('market_cap', 0), reverse=True)
-    
-    state["company_data"] = relevant_companies[:5]
-    
+        # Fallback to live data fetching if SQL fails or returns nothing
+        logger.warning("SQL queries yielded no results. Falling back to live yfinance.")
+        company_data = get_stocks_by_real_criteria(query)
+
+    state["company_data"] = company_data[:5] # Ensure we only pass the top 5
+
+    # --- The Market Analysis part remains the same ---
     analysis_prompt = f"""
-    Analyze these real companies: {[{
+    Analyze these companies: {[{
         'name': c['name'], 
         'sector': c['sector'], 
-        'market_cap': f"${c['market_cap']/1000000000:.1f}B" if c['market_cap'] > 1000000000 else f"${c['market_cap']/1000000:.1f}M",
-        'pe_ratio': c['pe_ratio'],
-        'price': c['price']
-    } for c in relevant_companies[:3]]}
-    
-    Provide market analysis (2-3 sentences):
-    1. Current sector trends
-    2. Risk assessment
-    3. Growth potential
+        'market_cap': f"${c.get('market_cap', 0)/1000000000:.1f}B",
+        'pe_ratio': c.get('pe_ratio', 'N/A'),
+        'price': c.get('price', 'N/A')
+    } for c in state["company_data"][:3]]}
+
+    Provide a brief market analysis (2-3 sentences) covering sector trends and general risk.
     """
-    
     try:
         analysis_response = llm.invoke([{"role": "user", "content": analysis_prompt}])
         state["market_analysis"] = analysis_response.content
     except Exception as e:
         logger.error(f"Market analysis failed: {e}")
-        state["market_analysis"] = "Market analysis unavailable due to technical issues."
-    
+        state["market_analysis"] = "Market analysis is currently unavailable."
+
     return state
 
 def recommendation_agent(state: FinancialAgentState):
@@ -811,9 +816,126 @@ def create_financial_workflow():
     return workflow.compile()
 
 def is_financial_query(query: str) -> bool:
-    """Check if query is financial"""
-    financial_keywords = ['invest', 'stock', 'portfolio', 'finance', 'company', 'market', 'buy', 'sell', 'recommendation', 'risk', 'return', 'shares']
-    return any(keyword in query.lower() for keyword in financial_keywords)
+    """
+    Check if a query is financial AND likely about a public company.
+    This prevents hijacking general queries about private companies.
+    """
+    query_lower = query.lower()
+    financial_keywords = [
+        'stock', 'portfolio', 'market', 'buy', 'sell', 'recommendation', 'risk', 
+        'return', 'shares', 'p/e', 'market cap', 'dividend', 'investment', 'ticker'
+    ]
+    
+    # Check for strong financial keywords
+    if any(keyword in query_lower for keyword in financial_keywords):
+        return True
+        
+    # Check for a potential stock ticker (e.g., "AAPL", "MSFT")
+    if re.search(r'\b[A-Z]{1,5}\b', query):
+        return True
+        
+    # If the query is just a generic "is [company name] safe?", it's likely not a request for stock analysis
+    # unless it includes other financial terms.
+    # This is a simple heuristic to avoid false positives.
+    if 'company' in query_lower or 'safe' in query_lower:
+        # Check if it *also* has a financial term, otherwise, treat as general knowledge.
+        return any(keyword in query_lower for keyword in ['stock', 'investment', 'p/e', 'market'])
+
+    return False
+def detect_intent(query: str) -> str:
+    """Classifies the user's intent."""
+    query_lower = query.lower()
+    if any(word in query_lower for word in ["buy", "add", "purchase"]):
+        # Look for a pattern like "buy 10 shares of AAPL"
+        if re.search(r'(\d+)\s+shares\s+of\s+([A-Z]+)', query, re.IGNORECASE):
+            return "add_to_portfolio"
+    if any(word in query_lower for word in ["show my portfolio", "my performance", "my stocks"]):
+        return "view_portfolio"
+    if is_financial_query(query):
+        return "financial_analysis"
+    return "general_query"
+def format_portfolio_response(performance_data: dict) -> str:
+    """Formats the portfolio performance data into a nice string."""
+    if not performance_data or not performance_data.get('positions'):
+        return "Your portfolio is currently empty. You can add a stock by saying, for example, 'buy 10 shares of AAPL'."
+    
+    response = f"### Your Portfolio Performance\n\n"
+    response += f"**Total Portfolio Value:** ${performance_data['total_value']:,.2f}\n"
+    response += f"**Total Cost Basis:** ${performance_data['total_cost']:,.2f}\n"
+    response += f"**Total P&L:** ${performance_data['total_pnl']:,.2f} ({performance_data['total_return_pct']:+.2f}%)\n\n"
+    
+    response += "#### Individual Holdings:\n"
+    for position in performance_data['positions']:
+        pnl_emoji = "📈" if position['pnl'] > 0 else "📉" if position['pnl'] < 0 else "➖"
+        response += f"**{position['symbol']}** - {position['shares']} shares\n"
+        response += f"  • Current: ${position['current_price']:.2f} | Purchase: ${position['purchase_price']:.2f}\n"
+        response += f"  • Value: ${position['current_value']:,.2f} | P&L: {pnl_emoji} ${position['pnl']:+,.2f} ({position['pnl_pct']:+.2f}%)\n\n"
+    
+    return response
+def web_search_ddg(query: str, max_results: int = 3) -> str:
+    """Search the web using DuckDuckGo for up-to-date information."""
+    try:
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=max_results))
+            
+        if not results:
+            return "No web search results found."
+            
+        search_summary = "Recent web search results:\n\n"
+        for i, result in enumerate(results, 1):
+            search_summary += f"{i}. **{result['title']}**\n"
+            search_summary += f"   {result['body'][:200]}...\n"
+            search_summary += f"   Source: {result['href']}\n\n"
+            
+        return search_summary
+        
+    except Exception as e:
+        logger.warning(f"Web search failed: {e}")
+        return "Web search temporarily unavailable."
+
+def handle_general_query_with_search(query: str, context: str, chat_history: list, file_path: str = None) -> str:
+    """Handle general queries with web search for accuracy."""
+    
+    # Determine if we should search the web
+    should_search = any(keyword in query.lower() for keyword in [
+        'company', 'startup', 'recent', 'news', 'current', 'today', 'latest', 
+        'what is', 'who is', 'tell me about'
+    ])
+    
+    web_results = ""
+    if should_search:
+        web_results = web_search_ddg(query, max_results=3)
+    
+    # Build the prompt
+    history_text = "\n".join(f"User: {msg['user']}\nAgent: {msg['agent']}" for msg in chat_history[-3:])
+    file_summary = extract_text_from_pdf(file_path) if file_path else ""
+    
+    full_prompt = f"""
+    You are a professional, helpful AI assistant. Provide clear and accurate responses.
+    
+    {f'Previous conversation context:\n{context}\n' if context else ''}
+    {f'Recent chat history:\n{history_text}\n' if history_text else ''}
+    {f'File content summary:\n{file_summary}\n' if file_summary else ''}
+    {f'Current web search results:\n{web_results}\n' if web_results else ''}
+    
+    User's question: {query}
+    
+    Instructions:
+    1. Use the web search results if available to provide accurate, up-to-date information
+    2. If asking about a specific company/organization, prioritize the web search results
+    3. Be direct and specific, not generic
+    4. If the web results are relevant, cite them in your response
+    5. Keep response concise and focused
+
+    Answer:
+    """
+    
+    try:
+        response = llm.invoke([{"role": "user", "content": full_prompt}]).content
+        return response
+    except Exception as e:
+        logger.error(f"LLM request failed: {e}")
+        return "I apologize, but I'm experiencing technical difficulties. Please try again in a moment."
 
 def run_customer_support(query: str,
                         force_language=None,
@@ -848,8 +970,37 @@ def run_customer_support(query: str,
     # Get conversation context
     context = conversation_memory.get_context_summary(user_id)
     
-    if is_financial_query(translated_query):
-        # Financial workflow
+    # Detect user intent (INDENTED PROPERLY NOW)
+    intent = detect_intent(translated_query)
+
+    if intent == "add_to_portfolio":
+        # Handle "buy X shares of Y" commands
+        match = re.search(r'buy\s+(\d+)\s+shares\s+of\s+([A-Z]+)', translated_query, re.IGNORECASE)
+        if match:
+            shares, symbol = match.groups()
+            try:
+                # Get current price
+                stock = yf.Ticker(symbol)
+                current_price = stock.history(period="1d")['Close'].iloc[-1]
+                
+                # Add to portfolio
+                success = portfolio_manager.add_to_portfolio(user_id, symbol, float(shares), current_price)
+                if success:
+                    response = f"✅ Successfully added {shares} shares of {symbol} to your portfolio at ${current_price:.2f} per share."
+                else:
+                    response = "❌ Failed to add to portfolio. Please try again."
+            except Exception as e:
+                response = f"❌ Error: Could not find stock '{symbol}' or fetch current price."
+        else:
+            response = "Please use the format: 'buy [number] shares of [SYMBOL]'. For example: 'buy 10 shares of AAPL'"
+
+    elif intent == "view_portfolio":
+        # Handle portfolio viewing
+        performance_data = portfolio_manager.get_portfolio_performance(user_id)
+        response = format_portfolio_response(performance_data)
+
+    elif intent == "financial_analysis":
+        # Financial workflow (your existing code)
         workflow = create_financial_workflow()
         
         initial_state = {
@@ -869,7 +1020,7 @@ def run_customer_support(query: str,
             result = workflow.invoke(initial_state)
             response = result["final_response"]
             
-            # Add demo information
+            # Add demo information (your existing code)
             demo_info = f"\n\n🔧 **Live Financial Analysis System:**\n"
             demo_info += f"**SQL Queries Generated:** {len(result['sql_queries'])}\n"
             demo_info += f"**Real-time Data Sources:** Yahoo Finance, Live Market Data\n"
@@ -889,45 +1040,19 @@ def run_customer_support(query: str,
             response = "Sorry, the financial analysis system is temporarily unavailable. Please try again later."
     
     else:
-        # Regular support
-        history_text = "\n".join(f"User: {msg['user']}\nAgent: {msg['agent']}" for msg in chat_history[-3:])
-        file_summary = extract_text_from_pdf(file_path) if file_path else ""
-        
-        full_prompt = f"""
-        You are a professional, helpful AI assistant. Provide clear and accurate responses.
-        
-        {f'Previous conversation context:\n{context}\n' if context else ''}
-        {f'Recent chat history:\n{history_text}\n' if history_text else ''}
-        {f'File content summary:\n{file_summary}\n' if file_summary else ''}
-        
-        User's question: {translated_query}
-        
-        Instructions:
-        1. Answer the EXACT question asked
-        2. If it's about a specific company, research that company
-        3. If asking about investment safety, address risk factors
-        4. Be direct and specific, not generic
-        5. Keep response concise and focused
+        # General queries - NOW WITH WEB SEARCH!
+        response = handle_general_query_with_search(translated_query, context, chat_history, file_path)
 
-        Answer:
-        """
-        
-        try:
-            response = llm.invoke([{"role": "user", "content": full_prompt}]).content
-        except Exception as e:
-            logger.error(f"LLM request failed: {e}")
-            response = "I apologize, but I'm experiencing technical difficulties. Please try again in a moment."
-    
-    # Store conversation
+    # Store conversation (MOVED OUT - common for all intents)
     conversation_memory.add_exchange(user_id, query, response)
-    
-    # Translate response
+
+    # Translate response (MOVED OUT - common for all intents)
     target_lang = force_language if force_language else detected_lang
     translated_response = translate_output_from_english(response, target_lang)
-    
+
     return {
         "original_language": SUPPORTED_LANGUAGES.get(detected_lang, detected_lang),
         "response": translated_response,
         "raw_response": response,
         "remaining_requests": remaining
-    }
+    }  # <- ADDED THE MISSING CLOSING BRACE

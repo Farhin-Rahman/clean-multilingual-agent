@@ -22,205 +22,154 @@ st.set_page_config(
 # Custom CSS for ChatGPT-like styling
 # Custom CSS for actual ChatGPT-like styling
 # ChatGPT-inspired clean styling
+# In app.py
+
+# DELETE your entire old CSS block and REPLACE it with this one.
 st.markdown("""
 <style>
-/* Import the exact font ChatGPT uses */
-@import url('https://fonts.googleapis.com/css2?family=Segoe+UI:wght@400;500;600&display=swap');
+    /* Import a font that is close to the new ChatGPT font */
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap');
 
-/* Remove all Streamlit default styling */
-#MainMenu {visibility: hidden;}
-footer {visibility: hidden;}
-header {visibility: hidden;}
-.stDeployButton {display:none;}
+    /* Hide Streamlit's default elements */
+    #MainMenu, .stDeployButton, footer, header {
+        visibility: hidden;
+    }
 
-/* ChatGPT exact background */
-.main {
-    background: linear-gradient(180deg, #f9f9f9 0%, #ffffff 50%, #f9f9f9 100%);
-    font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
-}
+    /* Modern ChatGPT "ombre" background */
+    .main {
+        background: radial-gradient(circle at 20% 20%, rgba(200, 180, 255, 0.1), transparent 30%),
+                    radial-gradient(circle at 80% 80%, rgba(180, 220, 255, 0.1), transparent 30%),
+                    #FFFFFF; /* Fallback solid color */
+        font-family: 'Inter', sans-serif;
+    }
 
-/* Remove padding */
-.main .block-container {
-    padding-top: 1rem;
-    padding-bottom: 1rem;
-    max-width: 48rem;
-}
+    /* Center the main chat content */
+    .main .block-container {
+        max-width: 52rem; /* Slightly wider for better look */
+        padding-top: 2rem;
+        padding-bottom: 2rem;
+    }
 
-/* Clean minimal header */
-.chat-header {
-    text-align: center;
-    padding: 1.5rem 0;
-    background: transparent;
-}
+    /* Chat header styling */
+    .chat-header {
+        text-align: center;
+        padding: 1rem 0 2rem 0;
+    }
+    .chat-header h1 {
+        font-size: 2.2rem;
+        font-weight: 600;
+        color: #1f2937;
+    }
+    .chat-header p {
+        font-size: 1rem;
+        color: #6b7280;
+    }
+    
+    /* Message container styling */
+    .user-message, .assistant-message {
+        padding: 1rem 1.5rem;
+        border-radius: 1rem;
+        margin-bottom: 1rem;
+        line-height: 1.6;
+        font-size: 0.95rem;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+    }
 
-.chat-header h1 {
-    color: #343541;
-    font-size: 1.5rem;
-    font-weight: 600;
-    margin: 0;
-}
+    .user-message {
+        background-color: #F3F4F6; /* Light gray for user */
+        color: #1f2937;
+        margin-left: 20%;
+    }
 
-.chat-header p {
-    color: #8e8ea0;
-    font-size: 0.875rem;
-    margin: 0.25rem 0 0 0;
-}
+    .assistant-message {
+        background-color: #FFFFFF;
+        color: #111827;
+        margin-right: 20%;
+        border: 1px solid #E5E7EB;
+    }
+    
+    /* Input area styling to match modern ChatGPT */
+    .stTextArea textarea {
+        border: 1px solid #D1D5DB !important;
+        border-radius: 1rem !important;
+        padding: 1rem !important;
+        background-color: #FFFFFF !important;
+        color: #111827 !important;
+        font-size: 1rem !important;
+        box-shadow: 0 1px 2px rgba(0,0,0,0.05) !important;
+        resize: none !important;
+    }
+    .stTextArea textarea:focus {
+        outline: none !important;
+        border-color: #6366F1 !important; /* A nice purple/blue focus color */
+        box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.4) !important;
+    }
+    
+    /* Send button styling */
+    .stButton > button {
+        background-color: #4F46E5 !important;
+        color: white !important;
+        border: none !important;
+        border-radius: 0.5rem !important;
+        padding: 0.6rem 1.2rem !important;
+        font-size: 1rem !important;
+        font-weight: 500 !important;
+        cursor: pointer !important;
+        transition: background-color 0.2s ease !important;
+    }
+    .stButton > button:hover {
+        background-color: #4338CA !important;
+    }
 
-/* Exact ChatGPT message styling */
-.user-message {
-    background-color: #343541;
-    color: #ffffff;
-    padding: 1rem 1.5rem;
-    border-radius: 1rem;
-    margin: 1rem 0;
-    margin-left: 20%;
-    position: relative;
-    font-size: 0.9rem;
-    line-height: 1.6;
-}
+    /* Sidebar styling */
+    .css-1d391kg { /* This is Streamlit's class for the sidebar */
+         background-color: #F9FAFB !important; /* Very light gray sidebar */
+         border-right: 1px solid #E5E7EB;
+    }
+    .sidebar .sidebar-content {
+        background-color: #F9FAFB !important;
+    }
+    .sidebar h3, .sidebar .stSelectbox label, .sidebar .stCheckbox label, .sidebar .stButton > button {
+        color: #374151 !important; /* Darker text for light background */
+    }
+    .sidebar .stButton > button {
+        border: 1px solid #D1D5DB !important;
+        background-color: #FFFFFF !important;
+        width: 100% !important;
+    }
+    .sidebar .stButton > button:hover {
+        background-color: #F3F4F6 !important;
+    }
 
-.assistant-message {
-    background-color: #f7f7f8;
-    color: #343541;
-    padding: 1rem 1.5rem;
-    border-radius: 1rem;
-    margin: 1rem 0;
-    margin-right: 20%;
-    position: relative;
-    font-size: 0.9rem;
-    line-height: 1.6;
-    border: 1px solid #e5e5e5;
-}
+    /* Remove the "Drag and drop file here" box border for a cleaner look */
+    .stFileUploader {
+        border: none !important;
+        background-color: #F9FAFB;
+        padding: 1rem;
+        border-radius: 0.75rem;
+    }
+    /* Demo status styling */
+    .demo-active {
+        background-color: #d1fae5;
+        color: #065f46;
+        padding: 0.75rem 1rem;
+        border-radius: 0.5rem;
+        border: 1px solid #a7f3d0;
+        font-size: 0.875rem;
+        margin: 1rem 0;
+    }
 
-/* Clean input field - exactly like ChatGPT */
-.stTextArea textarea {
-    border: 1px solid #d9d9e3 !important;
-    border-radius: 0.75rem !important;
-    padding: 1rem 1rem !important;
-    background-color: #ffffff !important;
-    color: #343541 !important;
-    font-size: 0.875rem !important;
-    resize: none !important;
-}
-
-.stTextArea textarea:focus {
-    outline: none !important;
-    border-color: #10a37f !important;
-    box-shadow: 0 0 0 1px #10a37f !important;
-}
-
-/* ChatGPT send button */
-.stButton > button {
-    background-color: #10a37f !important;
-    color: white !important;
-    border: none !important;
-    border-radius: 0.375rem !important;
-    padding: 0.5rem 1rem !important;
-    font-size: 0.875rem !important;
-    font-weight: 500 !important;
-    cursor: pointer !important;
-    transition: background-color 0.15s ease !important;
-}
-
-.stButton > button:hover {
-    background-color: #0d9065 !important;
-}
-
-/* Sidebar exactly like ChatGPT */
-.css-1d391kg {
-    background-color: #171717 !important;
-    color: #ffffff !important;
-}
-
-.sidebar .sidebar-content {
-    background-color: #171717 !important;
-    color: #ffffff !important;
-}
-
-.sidebar h3 {
-    color: #ffffff !important;
-    font-size: 0.875rem !important;
-    font-weight: 600 !important;
-}
-
-.sidebar .stSelectbox label {
-    color: #ffffff !important;
-    font-size: 0.875rem !important;
-}
-
-.sidebar .stCheckbox label {
-    color: #ffffff !important;
-    font-size: 0.875rem !important;
-}
-
-.sidebar .stButton > button {
-    background-color: transparent !important;
-    border: 1px solid #4d4d4f !important;
-    color: #ffffff !important;
-    width: 100% !important;
-    margin: 0.25rem 0 !important;
-}
-
-.sidebar .stButton > button:hover {
-    background-color: #2d2d30 !important;
-}
-
-/* Remove demo flashy styling */
-.demo-active {
-    background-color: #d1fae5;
-    color: #065f46;
-    padding: 0.75rem 1rem;
-    border-radius: 0.5rem;
-    border: 1px solid #a7f3d0;
-    font-size: 0.875rem;
-    margin: 1rem 0;
-}
-
-/* Clean voice section */
-.voice-recorder {
-    background-color: #ffffff;
-    border: 1px solid #e5e5e5;
-    border-radius: 0.75rem;
-    padding: 1rem;
-    margin: 1rem 0;
-}
-
-.voice-recorder h3 {
-    color: #343541;
-    font-size: 1rem;
-    font-weight: 500;
-    margin-bottom: 0.5rem;
-}
-
-/* Audio controls */
-audio {
-    width: 100%;
-    height: 32px;
-}
-
-/* Footer */
-.footer {
-    background-color: #f7f7f8;
-    border: 1px solid #e5e5e5;
-    color: #8e8ea0;
-    padding: 0.75rem 1rem;
-    border-radius: 0.5rem;
-    text-align: center;
-    font-size: 0.8125rem;
-    margin-top: 2rem;
-}
-
-/* Remove all animations */
-* {
-    animation: none !important;
-    transition: none !important;
-}
-
-.stButton > button,
-.stTextArea textarea {
-    transition: background-color 0.15s ease, border-color 0.15s ease !important;
-}
-
+    /* Footer styling */
+    .footer {
+        background-color: #f7f7f8;
+        border: 1px solid #e5e5e5;
+        color: #8e8ea0;
+        padding: 0.75rem 1rem;
+        border-radius: 0.5rem;
+        text-align: center;
+        font-size: 0.8125rem;
+        margin-top: 2rem;
+    }
 </style>
 """, unsafe_allow_html=True)
 
