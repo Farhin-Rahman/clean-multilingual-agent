@@ -900,9 +900,16 @@ def run_customer_support(query: str,
         {f'Recent chat history:\n{history_text}\n' if history_text else ''}
         {f'File content summary:\n{file_summary}\n' if file_summary else ''}
         
-        Current query: {translated_query}
+        User's question: {translated_query}
         
-        Provide a helpful, professional response. If this relates to previous conversation, acknowledge the context.
+        Instructions:
+        1. Answer the EXACT question asked
+        2. If it's about a specific company, research that company
+        3. If asking about investment safety, address risk factors
+        4. Be direct and specific, not generic
+        5. Keep response concise and focused
+
+        Answer:
         """
         
         try:

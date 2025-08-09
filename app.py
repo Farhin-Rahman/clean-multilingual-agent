@@ -21,223 +21,204 @@ st.set_page_config(
 
 # Custom CSS for ChatGPT-like styling
 # Custom CSS for actual ChatGPT-like styling
+# ChatGPT-inspired clean styling
 st.markdown("""
 <style>
-/* Import ChatGPT font */
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap');
+/* Import the exact font ChatGPT uses */
+@import url('https://fonts.googleapis.com/css2?family=Segoe+UI:wght@400;500;600&display=swap');
 
-/* Remove Streamlit branding and styling */
+/* Remove all Streamlit default styling */
 #MainMenu {visibility: hidden;}
 footer {visibility: hidden;}
 header {visibility: hidden;}
+.stDeployButton {display:none;}
 
-/* Global styling - ChatGPT colors */
+/* ChatGPT exact background */
 .main {
-    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: linear-gradient(180deg, #f9f9f9 0%, #ffffff 50%, #f9f9f9 100%);
+    font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
 }
 
-/* ChatGPT-like background gradient */
-.main > div {
-    background: linear-gradient(180deg, #f7f7f8 0%, #ffffff 100%);
-    min-height: 100vh;
-}
-
-/* Hide Streamlit header */
-.main > div > div > div > div > section > div {
+/* Remove padding */
+.main .block-container {
     padding-top: 1rem;
+    padding-bottom: 1rem;
+    max-width: 48rem;
 }
 
-/* Clean header - no flashy colors */
+/* Clean minimal header */
 .chat-header {
-    background: #ffffff;
-    padding: 2rem 0;
     text-align: center;
-    margin-bottom: 2rem;
-    border-bottom: 1px solid #e5e5e5;
+    padding: 1.5rem 0;
+    background: transparent;
 }
 
 .chat-header h1 {
-    color: #2d3748;
+    color: #343541;
+    font-size: 1.5rem;
     font-weight: 600;
-    font-size: 2rem;
     margin: 0;
 }
 
 .chat-header p {
-    color: #6b7280;
-    font-size: 0.95rem;
-    margin: 0.5rem 0 0 0;
-    font-weight: 400;
+    color: #8e8ea0;
+    font-size: 0.875rem;
+    margin: 0.25rem 0 0 0;
 }
 
-/* ChatGPT message styling */
+/* Exact ChatGPT message styling */
 .user-message {
-    background-color: #2d3748;
-    color: white;
+    background-color: #343541;
+    color: #ffffff;
     padding: 1rem 1.5rem;
-    border-radius: 18px;
-    margin: 1.5rem 0;
-    max-width: 75%;
-    margin-left: auto;
-    margin-right: 0;
-    font-size: 0.95rem;
-    line-height: 1.5;
+    border-radius: 1rem;
+    margin: 1rem 0;
+    margin-left: 20%;
+    position: relative;
+    font-size: 0.9rem;
+    line-height: 1.6;
 }
 
 .assistant-message {
-    background-color: #f1f3f4;
-    color: #2d3748;
+    background-color: #f7f7f8;
+    color: #343541;
     padding: 1rem 1.5rem;
-    border-radius: 18px;
-    margin: 1.5rem 0;
-    max-width: 75%;
-    margin-right: auto;
-    margin-left: 0;
-    font-size: 0.95rem;
-    line-height: 1.5;
-    border: 1px solid #e5e7eb;
+    border-radius: 1rem;
+    margin: 1rem 0;
+    margin-right: 20%;
+    position: relative;
+    font-size: 0.9rem;
+    line-height: 1.6;
+    border: 1px solid #e5e5e5;
 }
 
-/* Clean input styling */
+/* Clean input field - exactly like ChatGPT */
 .stTextArea textarea {
-    border: 1px solid #d1d5db !important;
-    border-radius: 12px !important;
-    padding: 1rem 1.5rem !important;
-    font-size: 0.95rem !important;
-    background-color: white !important;
-    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05) !important;
+    border: 1px solid #d9d9e3 !important;
+    border-radius: 0.75rem !important;
+    padding: 1rem 1rem !important;
+    background-color: #ffffff !important;
+    color: #343541 !important;
+    font-size: 0.875rem !important;
+    resize: none !important;
 }
 
 .stTextArea textarea:focus {
-    border-color: #6366f1 !important;
-    box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.1) !important;
     outline: none !important;
+    border-color: #10a37f !important;
+    box-shadow: 0 0 0 1px #10a37f !important;
 }
 
-/* Simple button - no gradients */
-.stButton button {
-    background-color: #2d3748 !important;
+/* ChatGPT send button */
+.stButton > button {
+    background-color: #10a37f !important;
     color: white !important;
     border: none !important;
-    border-radius: 8px !important;
-    padding: 0.75rem 2rem !important;
+    border-radius: 0.375rem !important;
+    padding: 0.5rem 1rem !important;
+    font-size: 0.875rem !important;
     font-weight: 500 !important;
-    font-size: 0.95rem !important;
-    transition: background-color 0.2s ease !important;
+    cursor: pointer !important;
+    transition: background-color 0.15s ease !important;
 }
 
-.stButton button:hover {
-    background-color: #1a202c !important;
-    transform: none !important;
-    box-shadow: none !important;
+.stButton > button:hover {
+    background-color: #0d9065 !important;
 }
 
-/* Clean sidebar */
+/* Sidebar exactly like ChatGPT */
+.css-1d391kg {
+    background-color: #171717 !important;
+    color: #ffffff !important;
+}
+
 .sidebar .sidebar-content {
-    background-color: #ffffff !important;
-    border-right: 1px solid #e5e7eb !important;
+    background-color: #171717 !important;
+    color: #ffffff !important;
 }
 
-/* Minimal info boxes */
-.stInfo {
-    background-color: #f0f9ff !important;
-    border: 1px solid #bfdbfe !important;
-    border-radius: 8px !important;
-    color: #1e40af !important;
+.sidebar h3 {
+    color: #ffffff !important;
+    font-size: 0.875rem !important;
+    font-weight: 600 !important;
 }
 
-/* Clean demo indicator */
+.sidebar .stSelectbox label {
+    color: #ffffff !important;
+    font-size: 0.875rem !important;
+}
+
+.sidebar .stCheckbox label {
+    color: #ffffff !important;
+    font-size: 0.875rem !important;
+}
+
+.sidebar .stButton > button {
+    background-color: transparent !important;
+    border: 1px solid #4d4d4f !important;
+    color: #ffffff !important;
+    width: 100% !important;
+    margin: 0.25rem 0 !important;
+}
+
+.sidebar .stButton > button:hover {
+    background-color: #2d2d30 !important;
+}
+
+/* Remove demo flashy styling */
 .demo-active {
-    background-color: #ecfdf5;
-    border: 1px solid #a7f3d0;
+    background-color: #d1fae5;
     color: #065f46;
-    padding: 1rem;
-    border-radius: 8px;
+    padding: 0.75rem 1rem;
+    border-radius: 0.5rem;
+    border: 1px solid #a7f3d0;
+    font-size: 0.875rem;
     margin: 1rem 0;
-    font-size: 0.9rem;
 }
 
-/* Simple voice recorder section */
+/* Clean voice section */
 .voice-recorder {
     background-color: #ffffff;
-    border: 1px solid #e5e7eb;
-    border-radius: 12px;
-    padding: 1.5rem;
-    margin: 1.5rem 0;
+    border: 1px solid #e5e5e5;
+    border-radius: 0.75rem;
+    padding: 1rem;
+    margin: 1rem 0;
 }
 
 .voice-recorder h3 {
-    color: #374151;
-    font-size: 1.1rem;
-    margin-bottom: 1rem;
+    color: #343541;
+    font-size: 1rem;
+    font-weight: 500;
+    margin-bottom: 0.5rem;
 }
 
-/* Audio player */
+/* Audio controls */
 audio {
     width: 100%;
-    margin: 1rem 0;
-    height: 40px;
+    height: 32px;
 }
 
-/* Clean footer */
+/* Footer */
 .footer {
-    background-color: #f9fafb;
-    border: 1px solid #e5e7eb;
-    color: #6b7280;
-    padding: 1rem;
-    border-radius: 8px;
+    background-color: #f7f7f8;
+    border: 1px solid #e5e5e5;
+    color: #8e8ea0;
+    padding: 0.75rem 1rem;
+    border-radius: 0.5rem;
     text-align: center;
+    font-size: 0.8125rem;
     margin-top: 2rem;
-    font-size: 0.9rem;
 }
 
-/* Remove animations and transitions */
+/* Remove all animations */
 * {
     animation: none !important;
-    transition: background-color 0.2s ease, border-color 0.2s ease, opacity 0.2s ease !important;
+    transition: none !important;
 }
 
-/* Clean selectbox */
-.stSelectbox > div > div {
-    background-color: white !important;
-    border: 1px solid #d1d5db !important;
-    border-radius: 6px !important;
-}
-
-/* Clean file uploader */
-.stFileUploader {
-    border: 1px dashed #d1d5db !important;
-    border-radius: 8px !important;
-    background-color: #fafafa !important;
-}
-
-/* Clean checkbox */
-.stCheckbox {
-    color: #374151 !important;
-}
-
-/* Clean number input */
-.stNumberInput > div > div > input {
-    border: 1px solid #d1d5db !important;
-    border-radius: 6px !important;
-    background-color: white !important;
-}
-
-/* Clean multiselect */
-.stMultiSelect > div > div {
-    background-color: white !important;
-    border: 1px solid #d1d5db !important;
-    border-radius: 6px !important;
-}
-
-/* Sidebar styling */
-.css-1d391kg {
-    background-color: #ffffff !important;
-}
-
-.css-1d391kg h3 {
-    color: #1f2937 !important;
-    font-weight: 600 !important;
+.stButton > button,
+.stTextArea textarea {
+    transition: background-color 0.15s ease, border-color 0.15s ease !important;
 }
 
 </style>
@@ -260,17 +241,24 @@ def transcribe_audio(audio_bytes, sample_rate):
     return transcription.strip()
 
 def generate_tts_audio(text):
-    tts = gTTS(text)
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
-        tts.save(tmp.name)
-        with open(tmp.name, 'rb') as audio_file:
-            audio_bytes = audio_file.read()
-    b64 = base64.b64encode(audio_bytes).decode()
-    return f"""
-        <audio controls style="width: 100%; margin: 0.5rem 0;">
-        <source src="data:audio/mp3;base64,{b64}" type="audio/mp3">
-        </audio>
-    """
+    try:
+        # Limit text length for TTS (gTTS has limits)
+        if len(text) > 500:
+            text = text[:500] + "..."
+        
+        tts = gTTS(text)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
+            tts.save(tmp.name)
+            with open(tmp.name, 'rb') as audio_file:
+                audio_bytes = audio_file.read()
+        b64 = base64.b64encode(audio_bytes).decode()
+        return f"""
+            <audio controls style="width: 100%; margin: 0.5rem 0;">
+            <source src="data:audio/mp3;base64,{b64}" type="audio/mp3">
+            </audio>
+        """
+    except Exception as e:
+        return "<p><em>Audio generation temporarily unavailable</em></p>"
 
 def show_financial_demo():
     st.sidebar.markdown("---")
