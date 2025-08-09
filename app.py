@@ -20,167 +20,224 @@ st.set_page_config(
 )
 
 # Custom CSS for ChatGPT-like styling
+# Custom CSS for actual ChatGPT-like styling
 st.markdown("""
 <style>
-/* Import Google Fonts */
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+/* Import ChatGPT font */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap');
 
-/* Global Styling */
+/* Remove Streamlit branding and styling */
+#MainMenu {visibility: hidden;}
+footer {visibility: hidden;}
+header {visibility: hidden;}
+
+/* Global styling - ChatGPT colors */
 .main {
-    font-family: 'Inter', sans-serif;
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
 }
 
-/* Main container */
+/* ChatGPT-like background gradient */
 .main > div {
-    padding-top: 2rem;
+    background: linear-gradient(180deg, #f7f7f8 0%, #ffffff 100%);
+    min-height: 100vh;
 }
 
-/* ChatGPT-like header */
+/* Hide Streamlit header */
+.main > div > div > div > div > section > div {
+    padding-top: 1rem;
+}
+
+/* Clean header - no flashy colors */
 .chat-header {
-    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-    padding: 1.5rem;
-    border-radius: 10px;
-    color: white;
+    background: #ffffff;
+    padding: 2rem 0;
     text-align: center;
     margin-bottom: 2rem;
-    box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1);
+    border-bottom: 1px solid #e5e5e5;
 }
 
 .chat-header h1 {
-    margin: 0;
+    color: #2d3748;
     font-weight: 600;
-    font-size: 2.2rem;
+    font-size: 2rem;
+    margin: 0;
 }
 
 .chat-header p {
+    color: #6b7280;
+    font-size: 0.95rem;
     margin: 0.5rem 0 0 0;
-    opacity: 0.9;
-    font-size: 1rem;
+    font-weight: 400;
 }
 
-/* Chat messages */
+/* ChatGPT message styling */
 .user-message {
-    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    background-color: #2d3748;
     color: white;
     padding: 1rem 1.5rem;
-    border-radius: 18px 18px 5px 18px;
-    margin: 1rem 0;
-    margin-left: 20%;
-    box-shadow: 0 2px 10px rgba(102, 126, 234, 0.3);
-    animation: slideInRight 0.3s ease;
+    border-radius: 18px;
+    margin: 1.5rem 0;
+    max-width: 75%;
+    margin-left: auto;
+    margin-right: 0;
+    font-size: 0.95rem;
+    line-height: 1.5;
 }
 
 .assistant-message {
-    background: linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%);
-    color: #333;
+    background-color: #f1f3f4;
+    color: #2d3748;
     padding: 1rem 1.5rem;
-    border-radius: 18px 18px 18px 5px;
-    margin: 1rem 0;
-    margin-right: 20%;
-    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
-    border-left: 4px solid #667eea;
-    animation: slideInLeft 0.3s ease;
+    border-radius: 18px;
+    margin: 1.5rem 0;
+    max-width: 75%;
+    margin-right: auto;
+    margin-left: 0;
+    font-size: 0.95rem;
+    line-height: 1.5;
+    border: 1px solid #e5e7eb;
 }
 
-@keyframes slideInRight {
-    from { transform: translateX(100px); opacity: 0; }
-    to { transform: translateX(0); opacity: 1; }
-}
-
-@keyframes slideInLeft {
-    from { transform: translateX(-100px); opacity: 0; }
-    to { transform: translateX(0); opacity: 1; }
-}
-
-/* Input area styling */
+/* Clean input styling */
 .stTextArea textarea {
-    border-radius: 25px;
-    border: 2px solid #e9ecef;
-    padding: 1rem 1.5rem;
-    font-size: 1rem;
-    transition: all 0.3s ease;
-    background: white;
+    border: 1px solid #d1d5db !important;
+    border-radius: 12px !important;
+    padding: 1rem 1.5rem !important;
+    font-size: 0.95rem !important;
+    background-color: white !important;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05) !important;
 }
 
 .stTextArea textarea:focus {
-    border-color: #667eea;
-    box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+    border-color: #6366f1 !important;
+    box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.1) !important;
+    outline: none !important;
 }
 
-/* Button styling */
+/* Simple button - no gradients */
 .stButton button {
-    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-    color: white;
-    border: none;
-    border-radius: 25px;
-    padding: 0.7rem 2rem;
-    font-weight: 600;
-    transition: all 0.3s ease;
-    box-shadow: 0 4px 15px rgba(102, 126, 234, 0.3);
+    background-color: #2d3748 !important;
+    color: white !important;
+    border: none !important;
+    border-radius: 8px !important;
+    padding: 0.75rem 2rem !important;
+    font-weight: 500 !important;
+    font-size: 0.95rem !important;
+    transition: background-color 0.2s ease !important;
 }
 
 .stButton button:hover {
-    transform: translateY(-2px);
-    box-shadow: 0 6px 20px rgba(102, 126, 234, 0.4);
+    background-color: #1a202c !important;
+    transform: none !important;
+    box-shadow: none !important;
+}
+
+/* Clean sidebar */
+.sidebar .sidebar-content {
+    background-color: #ffffff !important;
+    border-right: 1px solid #e5e7eb !important;
+}
+
+/* Minimal info boxes */
+.stInfo {
+    background-color: #f0f9ff !important;
+    border: 1px solid #bfdbfe !important;
+    border-radius: 8px !important;
+    color: #1e40af !important;
+}
+
+/* Clean demo indicator */
+.demo-active {
+    background-color: #ecfdf5;
+    border: 1px solid #a7f3d0;
+    color: #065f46;
+    padding: 1rem;
+    border-radius: 8px;
+    margin: 1rem 0;
+    font-size: 0.9rem;
+}
+
+/* Simple voice recorder section */
+.voice-recorder {
+    background-color: #ffffff;
+    border: 1px solid #e5e7eb;
+    border-radius: 12px;
+    padding: 1.5rem;
+    margin: 1.5rem 0;
+}
+
+.voice-recorder h3 {
+    color: #374151;
+    font-size: 1.1rem;
+    margin-bottom: 1rem;
+}
+
+/* Audio player */
+audio {
+    width: 100%;
+    margin: 1rem 0;
+    height: 40px;
+}
+
+/* Clean footer */
+.footer {
+    background-color: #f9fafb;
+    border: 1px solid #e5e7eb;
+    color: #6b7280;
+    padding: 1rem;
+    border-radius: 8px;
+    text-align: center;
+    margin-top: 2rem;
+    font-size: 0.9rem;
+}
+
+/* Remove animations and transitions */
+* {
+    animation: none !important;
+    transition: background-color 0.2s ease, border-color 0.2s ease, opacity 0.2s ease !important;
+}
+
+/* Clean selectbox */
+.stSelectbox > div > div {
+    background-color: white !important;
+    border: 1px solid #d1d5db !important;
+    border-radius: 6px !important;
+}
+
+/* Clean file uploader */
+.stFileUploader {
+    border: 1px dashed #d1d5db !important;
+    border-radius: 8px !important;
+    background-color: #fafafa !important;
+}
+
+/* Clean checkbox */
+.stCheckbox {
+    color: #374151 !important;
+}
+
+/* Clean number input */
+.stNumberInput > div > div > input {
+    border: 1px solid #d1d5db !important;
+    border-radius: 6px !important;
+    background-color: white !important;
+}
+
+/* Clean multiselect */
+.stMultiSelect > div > div {
+    background-color: white !important;
+    border: 1px solid #d1d5db !important;
+    border-radius: 6px !important;
 }
 
 /* Sidebar styling */
-.sidebar .sidebar-content {
-    background: linear-gradient(180deg, #f8f9fa 0%, #e9ecef 100%);
+.css-1d391kg {
+    background-color: #ffffff !important;
 }
 
-/* Info boxes */
-.stInfo {
-    background: linear-gradient(135deg, #17a2b8 0%, #138496 100%);
-    color: white;
-    border-radius: 10px;
-    border: none;
-}
-
-/* Audio player styling */
-audio {
-    width: 100%;
-    margin: 0.5rem 0;
-}
-
-/* Financial demo styling */
-.demo-active {
-    background: linear-gradient(135deg, #28a745 0%, #20c997 100%);
-    color: white;
-    padding: 1rem;
-    border-radius: 10px;
-    margin: 1rem 0;
-    animation: pulse 2s infinite;
-}
-
-@keyframes pulse {
-    0% { transform: scale(1); }
-    50% { transform: scale(1.02); }
-    100% { transform: scale(1); }
-}
-
-/* Footer styling */
-.footer {
-    background: linear-gradient(135deg, #6c757d 0%, #495057 100%);
-    color: white;
-    padding: 1rem;
-    border-radius: 10px;
-    text-align: center;
-    margin-top: 2rem;
-}
-
-/* Voice recorder styling */
-.voice-recorder {
-    background: linear-gradient(135deg, #fd7e14 0%, #e63946 100%);
-    border-radius: 15px;
-    padding: 1rem;
-    margin: 1rem 0;
-    color: white;
-}
-
-/* Spinner customization */
-.stSpinner > div {
-    border-top-color: #667eea !important;
+.css-1d391kg h3 {
+    color: #1f2937 !important;
+    font-weight: 600 !important;
 }
 
 </style>
@@ -288,10 +345,11 @@ with st.sidebar:
         st.rerun()
 
 # Header
+# Header
 st.markdown("""
 <div class="chat-header">
-    <h1>🤖 AI Financial Assistant</h1>
-    <p>Your intelligent multilingual financial advisor powered by real-time market data</p>
+    <h1>AI Financial Assistant</h1>
+    <p>Intelligent financial analysis with real-time market data</p>
 </div>
 """, unsafe_allow_html=True)
 
