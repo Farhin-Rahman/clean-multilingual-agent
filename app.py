@@ -45,7 +45,7 @@ def generate_tts_audio(text):
 def show_financial_demo():
     st.sidebar.markdown("---")
     st.sidebar.header("🏦 Financial Advisory Demo")
-    st.sidebar.markdown("*Demonstrates multi-agent AI system*")
+    st.sidebar.markdown("*Real-time market analysis system*")
     
     demo_enabled = st.sidebar.checkbox("Enable Financial Mode", value=False)
     
@@ -58,13 +58,14 @@ def show_financial_demo():
         investment_amount = st.sidebar.number_input("Investment Amount ($)", 
             min_value=1000, max_value=100000, value=25000)
         
-        st.sidebar.markdown("**Try these example queries:**")
+        st.sidebar.markdown("**Try these dynamic queries:**")
         example_queries = [
-            "Find safe technology stocks for conservative investors",
-            "Recommend high-growth companies under $100 per share", 
-            "What are the best healthcare investments for medium risk tolerance?",
-            "Show me companies with low P/E ratios in the finance sector"
-        ]
+            "Find safe technology stocks with low P/E ratios",
+            "Show me high-growth companies under $50 per share", 
+            "What are undervalued healthcare stocks with good margins?",
+            "Recommend stable dividend stocks in the energy sector",
+            "Find growth companies with revenue growth over 15%"
+            ]
         
         for i, example in enumerate(example_queries, 1):
             if st.sidebar.button(f"Example {i}", key=f"ex_{i}"):
@@ -121,7 +122,7 @@ if 'financial_mode' not in st.session_state:
 if any('invest' in msg.get('content', '').lower() or 'stock' in msg.get('content', '').lower() 
        or 'company' in msg.get('content', '').lower() or 'finance' in msg.get('content', '').lower()
        for msg in st.session_state.messages):
-    st.info("🤖 **Multi-Agent Financial System Active** - Demonstrating SQL generation, data integration, and investment recommendations")
+    st.info("🤖 **Real-Time Financial Analysis Active** - Using live S&P 500 data, dynamic sector filtering, and real market metrics")
 
 # Chat display
 for msg in st.session_state.messages:
@@ -162,7 +163,7 @@ if st.button("Send"):
                     "agent": st.session_state.messages[i + 1]["content"]
                 })
 
-        with st.spinner("🤖 Multi-agent system working..."):
+        with st.spinner("🤖 Real-time market analysis..."):
             result = run_customer_support(query, language_mapping[display_language], chat_history, file_path)
         st.session_state.messages.append({"role": "agent", "content": result["response"]})
         st.session_state.clear_query = True
@@ -170,4 +171,4 @@ if st.button("Send"):
 
 # Footer with demo information
 st.markdown("---")
-st.markdown("**Demo Features:** Multi-agent orchestration • SQL query generation • Data integration • Investment recommendations • Business automation")
+st.markdown("**Live Features:** Real S&P 500 data • Dynamic sector analysis • Live market screening • Real-time stock metrics • Professional investment recommendations")
