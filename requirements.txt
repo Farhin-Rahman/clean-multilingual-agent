@@ -15,8 +15,7 @@ yfinance
 requests
 pandas
 alpha-vantage
+finnhub-python
+fredapi
 lxml
 html5lib
-
-
-
