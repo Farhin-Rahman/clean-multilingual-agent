@@ -17,7 +17,7 @@ import sqlite3
 import finnhub
 from datetime import datetime, timedelta
 import numpy as np
-from fredapi import FRED
+from fredapi import Fred 
 import logging
 import hashlib
 import time
@@ -95,25 +95,23 @@ class RateLimiter:
     def __init__(self):
         self.requests = {}
         self.limits = {
-            'free': {'requests': 10, 'window': 3600},
-            'premium': {'requests': 100, 'window': 3600}
-        }
+            'free': {'requests': 100, 'window': 3600}  # 100 per hour - generous for portfolio demo
+            }
     
-    def is_allowed(self, user_id: str, tier: str = 'free') -> tuple[bool, int]:
+    def is_allowed(self, user_id: str) -> tuple[bool, int]:
         """Check if request is allowed"""
         now = time.time()
-        user_key = f"{user_id}_{tier}"
+        user_key = f"{user_id}_free"  # Always use free tier
         
         if user_key not in self.requests:
             self.requests[user_key] = []
-        
-        window = self.limits[tier]['window']
+        window = self.limits['free']['window']
         self.requests[user_key] = [req_time for req_time in self.requests[user_key] 
-                                  if now - req_time < window]
+                                       if now - req_time < window]
         
         current_count = len(self.requests[user_key])
-        limit = self.limits[tier]['requests']
-        
+        limit = self.limits['free']['requests']
+
         if current_count < limit:
             self.requests[user_key].append(now)
             return True, limit - current_count - 1
@@ -204,8 +202,8 @@ class ConversationMemory:
 
 class RealFinancialData:
     def __init__(self):
-        self.finnhub_client = finnhub.Client(api_key=FINNHUB_API_KEY) if FINNHUB_API_KEY else None
-        self.fred = FRED(api_key=FRED_API_KEY) if FRED_API_KEY else None
+        self.finnhub_client = finnhub.Client(api_key=FINNHUB_API_KEY) if (finnhub and FINNHUB_API_KEY) else None
+        self.fred = Fred(api_key=FRED_API_KEY) if FRED_API_KEY else None
         
     def get_comprehensive_stock_analysis(self, symbol):
         """Get real fundamental + technical analysis"""
