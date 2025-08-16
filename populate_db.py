@@ -1,20 +1,12 @@
-# populate_db.py
-import pandas as pd
-import yfinance as yf
-import sqlite3
-import numpy as np
-import logging
-import os, time
+# populate_db.py — seed SQLite companies table from S&P 500 via yfinance
+import pandas as pd, yfinance as yf, sqlite3, numpy as np, logging, os, time
 
-
-# Configure logging
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("populate_db")
 SP500_CACHE_FILE = "sp500_cache.csv"
 SP500_CACHE_TTL_HOURS = 24
 
 def get_sp500_tickers():
-    """Get real S&P 500 ticker list from Wikipedia with 24h cache & fallback."""
     try:
         if os.path.exists(SP500_CACHE_FILE):
             age = time.time() - os.path.getmtime(SP500_CACHE_FILE)
@@ -33,38 +25,32 @@ def get_sp500_tickers():
                 return pd.read_csv(SP500_CACHE_FILE)["Symbol"].tolist()
             except Exception:
                 pass
-        return []
+        return ["AAPL","MSFT","GOOGL","AMZN","NVDA","TSLA","META","JPM","JNJ","V"]
 
 def safe_latest_price(symbol: str):
     t = yf.Ticker(symbol)
     try:
         fi = getattr(t, "fast_info", {}) or {}
         p = fi.get("last_price") or fi.get("last_close")
-        if p:
-            return float(p)
+        if p: return float(p)
     except Exception:
         pass
     for period in ["5d", "1mo"]:
         try:
             h = t.history(period=period)["Close"].dropna()
-            if len(h):
-                return float(h.iloc[-1])
+            if len(h): return float(h.iloc[-1])
         except Exception:
             pass
     return None
 
 def populate_company_data():
-    """Fetches S&P 500 data and populates the SQLite database."""
     tickers = get_sp500_tickers()
     if not tickers:
-        logger.error("No tickers found. Aborting.")
-        return
+        logger.error("No tickers found. Aborting."); return
 
     db_path = "secure_portfolios.db"
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
+    conn = sqlite3.connect(db_path); cursor = conn.cursor()
 
-    # Create table if it doesn't exist, matching the agent's schema assumption
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS companies (
             symbol TEXT PRIMARY KEY,
@@ -78,17 +64,13 @@ def populate_company_data():
         )
     ''')
 
-    logger.info(f"Fetching data for {len(tickers)} companies. This may take a while...")
-    
+    logger.info(f"Fetching data for {len(tickers)} companies...")
     for symbol in tickers:
         try:
             price = safe_latest_price(symbol)
             info = {}
-            try:
-                info = yf.Ticker(symbol).info or {}
-            except Exception:
-                info = {}
-
+            try: info = yf.Ticker(symbol).info or {}
+            except Exception: info = {}
             if price is not None:
                 name = info.get('longName', symbol)
                 sector = info.get('sector', 'Unknown')
@@ -100,16 +82,12 @@ def populate_company_data():
                     INSERT OR REPLACE INTO companies (symbol, name, sector, market_cap, pe_ratio, price, risk_level, beta)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """, (symbol, name, sector, market_cap, pe_ratio, price, risk, beta))
-
-                
-                logger.info(f"Successfully added/updated {symbol}")
-
+                logger.info(f"Added/updated {symbol}")
         except Exception as e:
             logger.warning(f"Could not fetch data for {symbol}: {e}")
             continue
 
-    conn.commit()
-    conn.close()
+    conn.commit(); conn.close()
     logger.info("Database population complete.")
 
 if __name__ == "__main__":

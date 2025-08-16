@@ -1,38 +1,39 @@
-from typing import TypedDict, Dict, List, Optional, Any
+# support_agent.py — Free-first Financial Assistant with multi-RAG + rules + provenance
+from __future__ import annotations
+from typing import TypedDict, Dict, List, Optional, Any, Tuple
+from dataclasses import dataclass
 from langgraph.graph import StateGraph, END
-from langchain_core.prompts import ChatPromptTemplate  # (kept for future use)
 from functools import lru_cache
-from transformers import pipeline
-from langdetect import detect
-from langchain_groq import ChatGroq
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from dotenv import load_dotenv
 
 import fitz  # PyMuPDF
-import os
-import re
+
+import os, re, time, json, math, logging, hashlib, sqlite3, random
+import requests
+import requests_cache
 import yfinance as yf
 import pandas as pd
-import sqlite3
-import requests  # optional; handy for future endpoints
-
-# optional providers; keep app running even if not installed
-try:
-    import finnhub  # type: ignore
-except Exception:
-    finnhub = None
-
-try:
-    from fredapi import Fred  # type: ignore
-except Exception:
-    Fred = None
-
-from datetime import datetime, timedelta
 import numpy as np
-import logging
-import hashlib
-import time
-from contextlib import contextmanager
+from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# Optional: language detection/translation
+from langdetect import detect
+from transformers import pipeline
+
+# DuckDuckGo search (used by retrievers)
 from duckduckgo_search import DDGS
+
+# Validation & parsing
+from pydantic import BaseModel, Field, ValidationError
+import sqlglot
+from sqlglot.expressions import Select
+
+# Multi-RAG modules
+from rag_text import add_from_urls_text, retrieve_text
+from rag_logic import add_from_urls_logic, retrieve_logic, extract_logical as extract_logical_from_hits
+from rag_numeric import ingest_numeric_for_symbols, numeric_retrieve
 
 load_dotenv()
 
@@ -41,40 +42,30 @@ PRICE_BUCKET_SECONDS = 600
 SP500_CACHE_FILE = "sp500_cache.csv"
 SP500_CACHE_TTL_HOURS = 24
 SP500_FULL_CACHE_FILE = "sp500_full_cache.csv"
+AGENT_BUDGET_MS = int(os.getenv("AGENT_BUDGET_MS", "12000"))
 
+MIN_AUTH_SOURCE_SCORE = 0.35  # future use for authority scoring
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("support_agent")
 
-# Validate API keys
-if not os.getenv("GROQ_API_KEY"):
-    raise ValueError("GROQ_API_KEY not found. Please check your .env file.")
+# Lightweight HTTP cache for polite web usage
+requests_cache.install_cache("web_cache", backend="sqlite", expire_after=3600)
 
-# Optional API keys (graceful degradation)
-FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
-FRED_API_KEY = os.getenv("FRED_API_KEY")
-
-SUPPORTED_LANGUAGES = {
-    "bn": "Bengali",
-    "es": "Spanish",
-    "de": "German",
-    "fr": "French",
-    "it": "Italian",
-    "pt": "Portuguese",
-    "en": "English",
-}
-
-# Globals (initialized later)
-rate_limiter = None
-conversation_memory = None
-portfolio_manager = None
+# ───────────────────────────── Sentiment ───────────────────────────────────
+_SIA = SentimentIntensityAnalyzer()
+def _sent_score(titles: List[str]) -> float:
+    if not titles:
+        return 0.0
+    s = 0.0
+    for t in titles[:10]:
+        vs = _SIA.polarity_scores(t or "")
+        s += vs["compound"]
+    return float(s / max(1, min(10, len(titles))))
 
 # ───────────────────────────── Security / utils ────────────────────────────
 class SecurityManager:
-    """Production-grade security management"""
-
     @staticmethod
     def allowlist_sql(query: str) -> str:
-        """Read-only SQL allow-list: SELECT only, no comments, single statement."""
         q = (query or "").strip()
         if re.search(r"--|/\*|\*/", q):
             raise ValueError("SQL comments are not allowed.")
@@ -85,7 +76,6 @@ class SecurityManager:
 
     @staticmethod
     def validate_user_id(user_id: str) -> str:
-        """Validate and sanitize user ID"""
         if not user_id or len(user_id) < 1:
             return "anonymous_user"
         sanitized = re.sub(r"[^a-zA-Z0-9_]", "", user_id)[:50]
@@ -93,363 +83,202 @@ class SecurityManager:
 
     @staticmethod
     def hash_sensitive_data(data: str) -> str:
-        """Hash sensitive information"""
         return hashlib.sha256(data.encode()).hexdigest()[:16]
 
+APPROVED_TABLES = {"companies", "portfolios"}
+
+def validate_sql_ast(query: str) -> str:
+    safe_q = SecurityManager.allowlist_sql(query)
+    # Defense-in-depth denylist
+    if re.search(r"\b(with|union|attach|pragma|insert|update|delete|drop|alter|create|replace|vacuum)\b", safe_q, re.I):
+        raise ValueError("Forbidden SQL construct.")
+    try:
+        ast = sqlglot.parse_one(safe_q, read="sqlite")
+        if not isinstance(ast, Select):
+            raise ValueError("Only SELECT statements are allowed.")
+        tables = {t.name.lower() for t in ast.find_all(sqlglot.exp.Table)}
+        if not tables.issubset(APPROVED_TABLES):
+            raise ValueError(f"Query references non-approved tables: {tables - APPROVED_TABLES}")
+        return safe_q
+    except Exception as e:
+        raise ValueError(f"SQL validation failed: {e}")
 
 class RateLimiter:
-    """Production-grade rate limiting"""
-
     def __init__(self):
         self.requests: Dict[str, List[float]] = {}
-        self.limits = {"free": {"requests": 100, "window": 3600}}  # 100/hr
-
+        self.limits = {"free": {"requests": 100, "window": 3600}}
     def is_allowed(self, user_id: str) -> tuple[bool, int]:
         now = time.time()
-        user_key = f"{user_id}_free"  # Always use free tier
+        user_key = f"{user_id}_free"
         if user_key not in self.requests:
             self.requests[user_key] = []
         window = self.limits["free"]["window"]
-        self.requests[user_key] = [
-            t for t in self.requests[user_key] if now - t < window
-        ]
-        current_count = len(self.requests[user_key])
+        self.requests[user_key] = [t for t in self.requests[user_key] if now - t < window]
+        current = len(self.requests[user_key])
         limit = self.limits["free"]["requests"]
-        if current_count < limit:
+        if current < limit:
             self.requests[user_key].append(now)
-            return True, limit - current_count - 1
+            return True, limit - current - 1
         return False, 0
 
-
 class ConversationMemory:
-    """Enhanced conversation memory management"""
-
     def __init__(self, max_history: int = 20):
         self.max_history = max_history
         self.conversations: Dict[str, List[Dict[str, Any]]] = {}
-
-    def add_exchange(
-        self, user_id: str, user_msg: str, agent_msg: str, context: dict | None = None
-    ):
+    def add_exchange(self, user_id: str, user_msg: str, agent_msg: str, context: dict | None = None):
         if user_id not in self.conversations:
             self.conversations[user_id] = []
-        exchange = {
+        ex = {
             "timestamp": datetime.now().isoformat(),
             "user": user_msg,
             "agent": agent_msg,
             "context": context or {},
             "tokens": len(user_msg.split()) + len(agent_msg.split()),
         }
-        self.conversations[user_id].append(exchange)
+        self.conversations[user_id].append(ex)
         if len(self.conversations[user_id]) > self.max_history:
-            self.conversations[user_id] = self.conversations[user_id][
-                -self.max_history :
-            ]
-
+            self.conversations[user_id] = self.conversations[user_id][-self.max_history:]
     def get_context_summary(self, user_id: str, max_tokens: int = 1000) -> str:
-        if user_id not in self.conversations:
-            return ""
-        recent_exchanges = self.conversations[user_id][-5:]
-        total_tokens = 0
-        parts: List[str] = []
-        for ex in reversed(recent_exchanges):
-            if total_tokens + ex["tokens"] > max_tokens:
-                break
-            parts.append(
-                f"User: {ex['user']}\nAssistant: {ex['agent'][:200]}..."
-            )
-            total_tokens += ex["tokens"]
+        if user_id not in self.conversations: return ""
+        recent = self.conversations[user_id][-5:]
+        parts, total = [], 0
+        for ex in reversed(recent):
+            if total + ex["tokens"] > max_tokens: break
+            parts.append(f"User: {ex['user']}\nAssistant: {ex['agent'][:200]}...")
+            total += ex["tokens"]
         parts.reverse()
         fin = self.extract_financial_preferences(user_id)
-        if fin:
-            parts.append(f"\nUser Financial Profile: {fin}")
+        if fin: parts.append(f"\nUser Financial Profile: {fin}")
         return "\n---\n".join(parts)
-
     def extract_financial_preferences(self, user_id: str) -> str:
-        if user_id not in self.conversations:
-            return ""
+        if user_id not in self.conversations: return ""
         prefs = {"risk_tolerance": None, "sectors": []}
-        all_text = " ".join(
-            [ex["user"] + " " + ex["agent"] for ex in self.conversations[user_id]]
-        ).lower()
-        if any(w in all_text for w in ["conservative", "safe", "low risk"]):
-            prefs["risk_tolerance"] = "Conservative"
-        elif any(w in all_text for w in ["aggressive", "high risk", "growth"]):
-            prefs["risk_tolerance"] = "Aggressive"
+        all_text = " ".join([ex["user"] + " " + ex["agent"] for ex in self.conversations[user_id]]).lower()
+        if any(w in all_text for w in ["conservative", "safe", "low risk"]): prefs["risk_tolerance"]="Conservative"
+        elif any(w in all_text for w in ["aggressive", "high risk", "growth"]): prefs["risk_tolerance"]="Aggressive"
         sectors = ["technology", "healthcare", "finance", "energy", "consumer"]
         for s in sectors:
-            if s in all_text:
-                prefs["sectors"].append(s)
-        out = []
-        if prefs["risk_tolerance"]:
-            out.append(f"Risk: {prefs['risk_tolerance']}")
-        if prefs["sectors"]:
-            out.append(f"Interested sectors: {', '.join(prefs['sectors'])}")
+            if s in all_text: prefs["sectors"].append(s)
+        out=[]
+        if prefs["risk_tolerance"]: out.append(f"Risk: {prefs['risk_tolerance']}")
+        if prefs["sectors"]: out.append(f"Interested sectors: {', '.join(prefs['sectors'])}")
         return "; ".join(out)
 
+# Globals
+rate_limiter: Optional[RateLimiter] = None
+conversation_memory: Optional[ConversationMemory] = None
 
-class RealFinancialData:
-    def __init__(self):
-        self.finnhub_client = (
-            finnhub.Client(api_key=FINNHUB_API_KEY)
-            if (finnhub and FINNHUB_API_KEY)
-            else None
-        )
-        self.fred = Fred(api_key=FRED_API_KEY) if (Fred and FRED_API_KEY) else None
+# ─────────────────────── LLM router / Ollama client ──────────────────────
+@dataclass
+class _LLMResponse:
+    content: str
 
-    def get_comprehensive_stock_analysis(self, symbol: str) -> Dict[str, Any]:
-        data: Dict[str, Any] = {}
-        try:
-            if self.finnhub_client:
-                data["financials"] = self.finnhub_client.company_basic_financials(
-                    symbol, "all"
-                )
-                data["news"] = self.finnhub_client.company_news(
-                    symbol,
-                    _from=(datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d"),
-                    to=datetime.now().strftime("%Y-%m-%d"),
-                )
-                data["recommendations"] = self.finnhub_client.recommendation_trends(
-                    symbol
-                )
-                data["earnings"] = self.finnhub_client.company_earnings(
-                    symbol, limit=4
-                )
-            if self.fred:
-                end = datetime.today().date()
-                start = end - timedelta(days=365 * 2)
-                fed_data = self.fred.get_series(
-                    "FEDFUNDS", observation_start=start, observation_end=end
-                )
-                cpi = self.fred.get_series(
-                    "CPIAUCSL", observation_start=start, observation_end=end
-                )
-                data["interest_rates"] = (
-                    float(fed_data.dropna().iloc[-1])
-                    if fed_data is not None and len(fed_data.dropna())
-                    else 5.25
-                )
-                data["inflation"] = (
-                    float(cpi.pct_change().dropna().iloc[-1] * 100)
-                    if cpi is not None and len(cpi)
-                    else 3.2
-                )
-        except Exception as e:
-            logger.warning(f"API data fetch failed for {symbol}: {e}")
-            data = {"error": str(e)}
-        return data
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/chat")
 
+MODEL_CATALOG = {
+    "sql": ["llama3.1:8b-instruct-q4_0", "mistral:7b-instruct-q4_0"],
+    "analysis": ["mistral:7b-instruct-q4_0", "llama3.1:8b-instruct-q4_0"],
+    "default": ["llama3.1:8b-instruct-q4_0", "mistral:7b-instruct-q4_0"],
+}
 
-class SecurePortfolioManager:
-    """Production-grade portfolio management"""
+def _ollama_model_ok(model: str) -> bool:
+    try:
+        tags_url = OLLAMA_URL.replace("/api/chat", "/api/tags")
+        r = requests.get(tags_url, timeout=3)
+        r.raise_for_status()
+        models = [m.get("name") for m in r.json().get("models", [])]
+        return model in models
+    except Exception:
+        return False
 
-    def __init__(self):
-        self.db_path = "secure_portfolios.db"
-        self.security = SecurityManager()
-        self.init_database()
+def _ollama_invoke(messages: List[Dict[str, str]], model: str, temperature: float = 0.1) -> _LLMResponse:
+    try:
+        payload = {"model": model, "messages": messages, "stream": False, "options": {"temperature": temperature}}
+        r = requests.post(OLLAMA_URL, data=json.dumps(payload), timeout=60)
+        r.raise_for_status()
+        data = r.json()
+        txt = (data.get("message", {}) or {}).get("content", "") or data.get("content", "") or ""
+        return _LLMResponse(txt)
+    except Exception as e:
+        logger.warning(f"Ollama invoke failed for {model}: {e}")
+        return _LLMResponse("")
 
-    @contextmanager
-    def get_db_connection(self):
-        conn = None
-        try:
-            conn = sqlite3.connect(self.db_path)
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA synchronous=NORMAL")
-            yield conn
-        except Exception as e:
-            if conn:
-                conn.rollback()
-            logger.error(f"Database error: {e}")
-            raise
-        finally:
-            if conn:
-                conn.close()
-
-    def init_database(self):
-        try:
-            with self.get_db_connection() as conn:
-                conn.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS portfolios (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        user_id TEXT NOT NULL,
-                        symbol TEXT NOT NULL,
-                        shares REAL NOT NULL CHECK (shares > 0),
-                        purchase_price REAL NOT NULL CHECK (purchase_price > 0),
-                        purchase_date TEXT NOT NULL,
-                        risk_tolerance TEXT CHECK (risk_tolerance IN ('Low', 'Medium', 'High')),
-                        investment_goals TEXT,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        UNIQUE(user_id, symbol)
-                    )
-                    """
-                )
-                conn.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS user_profiles (
-                        user_id TEXT PRIMARY KEY,
-                        age INTEGER CHECK (age >= 18 AND age <= 100),
-                        risk_tolerance TEXT CHECK (risk_tolerance IN ('Conservative', 'Moderate', 'Aggressive')),
-                        investment_timeline TEXT,
-                        income_level TEXT,
-                        experience_level TEXT,
-                        financial_goals TEXT,
-                        created_date TEXT,
-                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    )
-                    """
-                )
-                conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_portfolios_user_id ON portfolios(user_id)"
-                )
-                conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_portfolios_symbol ON portfolios(symbol)"
-                )
-                conn.commit()
-        except Exception as e:
-            logger.error(f"Database initialization failed: {e}")
-
-    def add_to_portfolio(
-        self, user_id: str, symbol: str, shares: float, price: float
-    ) -> bool:
-        try:
-            user_id = self.security.validate_user_id(user_id)
-            symbol = re.sub(r"[^A-Z.\-]", "", symbol.upper())
-            if shares <= 0 or price <= 0:
-                raise ValueError("Shares and price must be positive")
-            with self.get_db_connection() as conn:
-                conn.execute(
-                    """
-                    INSERT OR REPLACE INTO portfolios
-                    (user_id, symbol, shares, purchase_price, purchase_date, risk_tolerance, investment_goals)
-                    VALUES (?, ?, ?, ?, date('now'), ?, ?)
-                    """,
-                    (user_id, symbol, shares, price, "Medium", "Growth"),
-                )
-                conn.commit()
-                return True
-        except Exception as e:
-            logger.error(f"Portfolio add failed: {e}")
-            return False
-
-    def get_portfolio_performance(self, user_id: str) -> dict:
-        try:
-            user_id = self.security.validate_user_id(user_id)
-            with self.get_db_connection() as conn:
-                positions = conn.execute(
-                    """
-                    SELECT symbol, shares, purchase_price
-                    FROM portfolios
-                    WHERE user_id = ?
-                    ORDER BY created_at DESC
-                    """,
-                    (user_id,),
-                ).fetchall()
-
-            total_value = 0.0
-            total_cost = 0.0
-            performance = []
-
-            for symbol, shares, purchase_price in positions:
-                try:
-                    current_price = safe_latest_price(symbol)
-                    if current_price is None:
-                        continue
-                    position_value = shares * current_price
-                    position_cost = shares * purchase_price
-                    pnl = position_value - position_cost
-                    pnl_pct = (pnl / position_cost) * 100 if position_cost > 0 else 0
-                    performance.append(
-                        {
-                            "symbol": symbol,
-                            "shares": shares,
-                            "current_price": round(current_price, 2),
-                            "purchase_price": purchase_price,
-                            "current_value": round(position_value, 2),
-                            "pnl": round(pnl, 2),
-                            "pnl_pct": round(pnl_pct, 2),
-                        }
-                    )
-                    total_value += position_value
-                    total_cost += position_cost
-                except Exception as e:
-                    logger.warning(f"Failed to get price for {symbol}: {e}")
-                    continue
-
-            return {
-                "positions": performance,
-                "total_value": round(total_value, 2),
-                "total_cost": round(total_cost, 2),
-                "total_pnl": round(total_value - total_cost, 2),
-                "total_return_pct": round(
-                    ((total_value - total_cost) / total_cost * 100), 2
-                )
-                if total_cost > 0
-                else 0,
-            }
-        except Exception as e:
-            logger.error(f"Portfolio performance calculation failed: {e}")
-            return {
-                "positions": [],
-                "total_value": 0,
-                "total_cost": 0,
-                "total_pnl": 0,
-                "total_return_pct": 0,
-            }
-
-
-# Initialize globals after classes exist
-def initialize_global_instances():
-    global rate_limiter, conversation_memory, portfolio_manager
-    if rate_limiter is None:
-        rate_limiter = RateLimiter()
-    if conversation_memory is None:
-        conversation_memory = ConversationMemory()
-    if portfolio_manager is None:
-        portfolio_manager = SecurePortfolioManager()
-
+def llm_call(task: str, messages: List[Dict[str, str]], max_tries: int = 2) -> _LLMResponse:
+    models = MODEL_CATALOG.get(task, MODEL_CATALOG["default"])
+    last = _LLMResponse("")
+    for m in models[:max_tries]:
+        if not _ollama_model_ok(m):
+            logger.warning(f"Model {m} not available in Ollama.")
+            continue
+        resp = _ollama_invoke(messages, model=m)
+        txt = resp.content.strip()
+        if task == "sql":
+            if re.search(r"```sql", txt, re.IGNORECASE):
+                return resp
+        else:
+            if len(txt) > 5:
+                return resp
+        last = resp
+    if last.content.strip():
+        return last
+    # graceful fallback message to surface in UI
+    return _LLMResponse("LLM not available locally (Ollama). Please pull a model like `ollama pull llama3.1:8b-instruct`.")
 
 # ─────────────────────── Stock data helpers / caching ──────────────────────
-def calculate_rsi(prices: pd.Series, periods: int = 14) -> float:
-    if len(prices) < periods:
-        return 50.0
-    delta = prices.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=periods).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=periods).mean()
-    rs = gain / loss
-    rsi = 100 - (100 / (1 + rs))
-    return float(rsi.iloc[-1]) if not rsi.empty else 50.0
-
+def retry(n=3, base=0.35, cap=2.5):
+    def deco(fn):
+        def inner(*a, **k):
+            last = None
+            for i in range(n):
+                try:
+                    return fn(*a, **k)
+                except Exception as e:
+                    last = e
+                    time.sleep(min(cap, base*(2**i)) + random.random()*0.1)
+            raise last
+        return inner
+    return deco
 
 @lru_cache(maxsize=512)
 def _get_ticker(symbol: str):
     return yf.Ticker(symbol)
 
-
 def _price_bucket():
     return int(time.time() // PRICE_BUCKET_SECONDS)
 
-
 @lru_cache(maxsize=4096)
+@retry()
 def _safe_latest_price_cached(symbol: str, bucket: int):
+    # returns price float or None
     try:
         t = _get_ticker(symbol)
         fi = getattr(t, "fast_info", {}) or {}
         p = fi.get("last_price") or fi.get("last_close") or fi.get("last_price_raw")
-        if p:
-            return float(p)
+        if p: return float(p)
         for period in ["5d", "1mo"]:
             h = t.history(period=period)["Close"].dropna()
-            if len(h):
-                return float(h.iloc[-1])
+            if len(h): return float(h.iloc[-1])
     except Exception:
         pass
     return None
 
-
 def safe_latest_price(symbol: str) -> Optional[float]:
     return _safe_latest_price_cached(symbol, _price_bucket())
 
+def safe_latest_price_with_staleness(symbol: str) -> Tuple[Optional[float], Optional[int]]:
+    try:
+        t = _get_ticker(symbol)
+        fi = getattr(t, "fast_info", {}) or {}
+        p = fi.get("last_price") or fi.get("last_close") or fi.get("last_price_raw")
+        if p: return float(p), 0
+        for period in ["5d", "1mo"]:
+            h = t.history(period=period)["Close"].dropna()
+            if len(h):
+                age_days = (datetime.utcnow().date() - h.index[-1].date()).days
+                return float(h.iloc[-1]), int(age_days)
+    except Exception:
+        pass
+    return None, None
 
 @lru_cache(maxsize=2048)
 def _close_series(symbol: str) -> pd.Series:
@@ -458,8 +287,17 @@ def _close_series(symbol: str) -> pd.Series:
     except Exception:
         return pd.Series(dtype=float)
 
+def calculate_rsi(prices: pd.Series, periods: int = 14) -> float:
+    if len(prices) < periods:
+        return 50.0
+    delta = prices.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=periods).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=periods).mean()
+    rs = gain / (loss.replace(0, np.nan))
+    rsi = 100 - (100 / (1 + rs))
+    val = rsi.iloc[-1]
+    return float(val) if pd.notna(val) else 50.0
 
-@lru_cache(maxsize=1024)
 def safe_info_and_vol(symbol: str) -> tuple[dict, float]:
     info, vol = {}, 0.0
     try:
@@ -471,17 +309,86 @@ def safe_info_and_vol(symbol: str) -> tuple[dict, float]:
         vol = float(close.pct_change().std() * np.sqrt(252))
     return info, vol
 
-
 def safe_sma_rsi(symbol: str, price_now: float) -> tuple[float, float]:
     close = _close_series(symbol)
     if close.empty:
         return float(price_now), 50.0
-    sma20 = float(close.rolling(20).mean().iloc[-1]) if len(close) >= 20 else float(
-        price_now
-    )
+    sma20 = float(close.rolling(20).mean().iloc[-1]) if len(close) >= 20 else float(price_now)
     rsi = float(calculate_rsi(close)) if len(close) >= 14 else 50.0
     return sma20, rsi
 
+def _headlines_for_symbol(sym: str, max_n=8) -> List[dict]:
+    items: List[dict] = []
+    try:
+        news = getattr(yf.Ticker(sym), "news", None) or []
+        for n in news:
+            t = n.get("title") or ""
+            u = n.get("link") or n.get("url") or ""
+            p = (n.get("publisher") or "").strip()
+            dt = n.get("providerPublishTime")
+            if isinstance(dt, (int, float)):
+                try: date = datetime.utcfromtimestamp(int(dt)).strftime("%Y-%m-%d")
+                except Exception: date = ""
+            else:
+                date = ""
+            if t and u:
+                items.append({"title": t, "url": u, "publisher": p, "date": date})
+    except Exception:
+        pass
+    return items[:max_n]
+
+def _batch_last_close(symbols: list[str]) -> dict[str, float]:
+    try:
+        if not symbols: return {}
+        df = yf.download(tickers=" ".join(symbols), period="5d", interval="1d", threads=True, progress=False)
+        if isinstance(df, pd.DataFrame) and "Close" in df:
+            close = df["Close"].ffill().iloc[-1]
+            if isinstance(close, pd.Series):
+                return {str(k): float(v) for k, v in close.dropna().to_dict().items()}
+            else:
+                return {symbols[0]: float(close)} if pd.notna(close) else {}
+        return {}
+    except Exception:
+        return {}
+
+def get_real_stock_data_parallel(symbols: list[str], max_workers: int = 8) -> list[dict]:
+    symbols = [s for s in symbols if s][:30]
+    prices = _batch_last_close(symbols)
+
+    def fetch_one(sym: str):
+        price_now = prices.get(sym)
+        if price_now is None: return None
+        info, vol = safe_info_and_vol(sym)
+        market_cap = info.get("marketCap", 0)
+        pe_ratio = info.get("trailingPE", 0)
+        sector = info.get("sector", "Unknown")
+        name = info.get("longName", sym)
+        beta = (info.get("beta") or 1.0)
+        if (beta and beta < 0.8) and (vol and vol < 0.25): risk = "Low"
+        elif (beta and beta > 1.2) or (vol and vol > 0.40): risk = "High"
+        else: risk = "Medium"
+        sma20, rsi = safe_sma_rsi(sym, price_now)
+        headlines = _headlines_for_symbol(sym)
+        sent = _sent_score([h["title"] for h in headlines])
+        return {
+            "name": name, "symbol": sym, "sector": sector,
+            "market_cap": market_cap, "pe_ratio": round(pe_ratio, 2) if pe_ratio else 0,
+            "price": round(price_now, 2), "risk": risk, "beta": round(beta, 2) if beta else 1.0,
+            "volatility": round(vol, 3) if vol else 0, "sma_20": round(sma20, 2),
+            "rsi": round(rsi, 1), "trend": "Bullish" if price_now > sma20 else "Bearish",
+            "sentiment": round(sent, 3), "provenance": [{"type":"news", **h} for h in headlines],
+        }
+
+    out = []
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futs = {ex.submit(fetch_one, s): s for s in symbols}
+        for f in as_completed(futs):
+            try:
+                row = f.result()
+                if row: out.append(row)
+            except Exception:
+                continue
+    return out
 
 def normalize_company_keys(c: dict) -> dict:
     return {
@@ -493,66 +400,22 @@ def normalize_company_keys(c: dict) -> dict:
         "price": c.get("price") or c.get("current_price"),
         "risk": c.get("risk") or c.get("risk_level") or "Medium",
         "beta": c.get("beta") or 1.0,
+        "volatility": c.get("volatility") or 0.0,
+        "sma_20": c.get("sma_20") or c.get("sma20"),
+        "rsi": c.get("rsi") or 50.0,
+        "trend": c.get("trend") or "",
+        "sentiment": c.get("sentiment") or 0.0,
+        "provenance": c.get("provenance") or [],
     }
 
-
-def get_real_stock_data(
-    symbols: List[str] = ["AAPL", "MSFT", "GOOGL", "JNJ", "JPM", "PFE", "XOM", "NVDA", "TSLA", "V"]
-) -> List[Dict[str, Any]]:
-    real_companies: List[Dict[str, Any]] = []
-    for symbol in symbols[:10]:
-        try:
-            price_now = safe_latest_price(symbol)
-            if price_now is None:
-                continue
-            info, vol = safe_info_and_vol(symbol)
-
-            market_cap = info.get("marketCap", 0)
-            pe_ratio = info.get("trailingPE", 0)
-            sector = info.get("sector", "Unknown")
-            name = info.get("longName", symbol)
-            beta = (info.get("beta") or 1.0)
-
-            if (beta and beta < 0.8) and (vol and vol < 0.25):
-                risk = "Low"
-            elif (beta and beta > 1.2) or (vol and vol > 0.40):
-                risk = "High"
-            else:
-                risk = "Medium"
-
-            sma20, rsi = safe_sma_rsi(symbol, price_now)
-
-            real_companies.append(
-                {
-                    "name": name,
-                    "symbol": symbol,
-                    "sector": sector,
-                    "market_cap": market_cap,
-                    "pe_ratio": round(pe_ratio, 2) if pe_ratio else 0,
-                    "price": round(price_now, 2),
-                    "risk": risk,
-                    "beta": round(beta, 2) if beta else 1.0,
-                    "volatility": round(vol, 3) if vol else 0,
-                    "sma_20": round(sma20, 2),
-                    "rsi": round(rsi, 1),
-                    "trend": "Bullish" if price_now > sma20 else "Bearish",
-                }
-            )
-        except Exception as e:
-            logger.warning(f"Error fetching {symbol}: {e}")
-            continue
-    return real_companies
-
-
+# Sector prefilter
 def get_sp500_tickers() -> List[str]:
     try:
         if os.path.exists(SP500_CACHE_FILE):
             age = time.time() - os.path.getmtime(SP500_CACHE_FILE)
             if age < SP500_CACHE_TTL_HOURS * 3600:
                 return pd.read_csv(SP500_CACHE_FILE)["Symbol"].tolist()
-        tables = pd.read_html(
-            "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-        )
+        tables = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
         tickers = tables[0]["Symbol"].str.replace(".", "-", regex=False).tolist()
         pd.DataFrame({"Symbol": tickers}).to_csv(SP500_CACHE_FILE, index=False)
         return tickers
@@ -563,29 +426,7 @@ def get_sp500_tickers() -> List[str]:
                 return pd.read_csv(SP500_CACHE_FILE)["Symbol"].tolist()
             except Exception:
                 pass
-        return [
-            "AAPL",
-            "MSFT",
-            "GOOGL",
-            "AMZN",
-            "TSLA",
-            "META",
-            "NVDA",
-            "JPM",
-            "JNJ",
-            "V",
-            "WMT",
-            "PG",
-            "UNH",
-            "HD",
-            "CVX",
-            "XOM",
-            "BAC",
-            "ABBV",
-            "KO",
-            "PFE",
-        ]
-
+        return ["AAPL","MSFT","GOOGL","AMZN","TSLA","META","NVDA","JPM","JNJ","V"]
 
 def get_sp500_table_cached() -> pd.DataFrame:
     try:
@@ -610,10 +451,7 @@ def get_sp500_table_cached() -> pd.DataFrame:
         tickers = get_sp500_tickers()
         return pd.DataFrame({"Symbol": tickers, "Sector": ["Unknown"] * len(tickers)})
 
-
-def prefilter_symbols_by_query(
-    query_lower: str, spx_df: pd.DataFrame, max_candidates: int = 80
-) -> List[str]:
+def prefilter_symbols_by_query(query_lower: str, spx_df: pd.DataFrame, max_candidates: int = 80) -> List[str]:
     sector_aliases = {
         "Information Technology": ["tech", "technology", "software", "semis", "semiconductor", "it"],
         "Health Care": ["health", "healthcare", "medical", "pharma", "biotech"],
@@ -631,67 +469,128 @@ def prefilter_symbols_by_query(
     df = spx_df[spx_df["Sector"].isin(sorted(wanted))] if wanted else spx_df
     return df["Symbol"].tolist()[:max_candidates]
 
+def get_real_stock_data(symbols: List[str]) -> List[Dict[str, Any]]:
+    # preserved (non-parallel) for compatibility if needed
+    return get_real_stock_data_parallel(symbols)
 
 def get_stocks_by_real_criteria(query: str) -> List[Dict[str, Any]]:
-    """Light prefilter by sector list, then fetch real metrics, then filter."""
     query_lower = query.lower()
     spx_df = get_sp500_table_cached()
-    candidates = prefilter_symbols_by_query(query_lower, spx_df, max_candidates=80)
-    if not candidates:
-        candidates = get_sp500_tickers()[:80]
-    real_companies = get_real_stock_data(candidates[:30])  # fast
-    filtered = filter_stocks_by_query(real_companies, query_lower)
-    return filtered[:10] if filtered else real_companies[:10]
-
-
-def filter_stocks_by_query(companies: List[dict], query_lower: str) -> List[dict]:
-    filtered = companies
+    candidates = prefilter_symbols_by_query(query_lower, spx_df, max_candidates=80) or get_sp500_tickers()[:80]
+    real_companies = get_real_stock_data_parallel(candidates[:30])
+    filtered = real_companies
     if any(w in query_lower for w in ["tech", "technology", "software"]):
         filtered = [c for c in filtered if "technology" in c.get("sector", "").lower()]
-    elif any(w in query_lower for w in ["health", "healthcare", "medical", "pharma"]):
-        filtered = [
-            c
-            for c in filtered
-            if any(x in c.get("sector", "").lower() for x in ["health", "pharma", "biotech"])
-        ]
-    elif any(w in query_lower for w in ["finance", "bank", "financial"]):
-        filtered = [c for c in filtered if "financial" in c.get("sector", "").lower()]
-    elif any(w in query_lower for w in ["energy", "oil", "gas"]):
-        filtered = [c for c in filtered if "energy" in c.get("sector", "").lower()]
-    elif any(w in query_lower for w in ["consumer", "retail"]):
-        filtered = [
-            c
-            for c in filtered
-            if "consumer" in c.get("sector", "").lower() or "retail" in c.get("sector", "").lower()
-        ]
-
     if any(w in query_lower for w in ["safe", "conservative", "stable"]):
-        filtered = [
-            c
-            for c in filtered
-            if (c.get("beta") is not None and c["beta"] < 1.0)
-            and (c.get("pe_ratio") and 0 < c["pe_ratio"] < 25)
-            and (c.get("market_cap") and c["market_cap"] > 10_000_000_000)
-        ]
+        filtered = [c for c in filtered if (c.get("beta",1.0) < 1.0 and 0 < (c.get("pe_ratio") or 0) < 25 and (c.get("market_cap") or 0) > 1e10)]
+    if "under 50" in query_lower or "under $50" in query_lower:
+        filtered = [c for c in filtered if (c.get("price") or 999) < 50]
+    return filtered[:10] or real_companies[:10]
 
-    if any(p in query_lower for p in ["under $50", "below 50", "under 50"]):
-        filtered = [c for c in filtered if c.get("price") and c["price"] < 50]
-    elif any(p in query_lower for p in ["under $100", "below 100", "under 100"]):
-        filtered = [c for c in filtered if c.get("price") and c["price"] < 100]
+# ───────────────────────── Rules / constraints ─────────────────────────────
+def check_constraints(company: dict, user_profile: dict) -> dict:
+    flags = []
+    risk_tol = (user_profile.get("risk_tolerance") or "").lower()
+    beta = company.get("beta") or 1.0
+    vol = company.get("volatility") or 0.3
+    pe = company.get("pe_ratio") if company.get("pe_ratio") is not None else 0.0
+    if risk_tol in ("conservative","low"):
+        if beta > 1.3 or vol > 0.45:
+            flags.append("risk_exceeds_profile")
+    if (pe or 0) < 0 and not company.get("eps"):
+        flags.append("pe_negative_unclear")
+    return {"allowed": len(flags) == 0, "flags": flags}
 
-    if any(p in query_lower for p in ["undervalued", "low pe", "value"]):
-        filtered = [c for c in filtered if c.get("pe_ratio") and 0 < c["pe_ratio"] < 15]
+DEFAULT_RULES = [
+    {"id":"conservative_block_high_beta","desc":"Block high beta for conservative","when": lambda c,p: (p.get("risk_tolerance","").lower() in {"conservative","low"}) and (c.get("beta",1.0) > 1.3),"action":"block"},
+    {"id":"flag_litigation_terms","desc":"Flag if litigation/regulatory terms appear","when": lambda c,p: any(k in (c.get("logical_facts") or {}) for k in ["litigation","regulatory"]),"action":"flag"},
+    {"id":"boost_profitable","desc":"Boost if profitable (eps>0 & PE>0)","when": lambda c,p: (c.get("eps") or 0) > 0 and (c.get("pe_ratio") or 0) > 0,"action":"boost:0.03"},
+]
 
-    if any(w in query_lower for w in ["startup", "growth", "new", "young"]):
-        filtered = [
-            c
-            for c in filtered
-            if (c.get("beta") and c["beta"] > 1.0) or (c.get("pe_ratio") and c["pe_ratio"] > 25)
-        ]
-    return filtered
+def apply_rules(company: dict, profile: dict) -> dict:
+    flags = []; blocked=False; boost=0.0
+    for r in DEFAULT_RULES:
+        try:
+            if r["when"](company, profile or {}):
+                if r["action"]=="block": blocked=True
+                elif r["action"].startswith("boost:"):
+                    try: boost += float(r["action"].split(":")[1])
+                    except Exception: pass
+                flags.append(r["id"])
+        except Exception:
+            continue
+    return {"blocked":blocked, "flags":flags, "boost":boost}
 
+# ─────────────────────── Numeric verification & MCDM ───────────────────────
+def numeric_verification(c: dict) -> dict:
+    try:
+        price = float(c.get("price") or 0)
+        pe = float(c.get("pe_ratio") or 0)
+        eps = c.get("eps")
+        if eps is not None:
+            eps = float(eps)
+            if eps != 0:
+                pe_calc = price / max(1e-9, eps)
+                if pe > 0 and 0.4 <= pe_calc/pe <= 2.5:
+                    return {"numeric_ok": True, "numeric_err": ""}
+                else:
+                    return {"numeric_ok": False, "numeric_err": f"PE sanity mismatch (calc≈{pe_calc:.1f}, pe={pe:.1f})"}
+        if pe >= 0:
+            return {"numeric_ok": True, "numeric_err": ""}
+        return {"numeric_ok": False, "numeric_err": "negative PE without EPS context"}
+    except Exception as e:
+        return {"numeric_ok": False, "numeric_err": f"exception {e}"}
 
-# ────────────────────── Translation / PDF / Web search ─────────────────────
+def _norm01(x: float, lo: float, hi: float) -> float:
+    try:
+        if hi <= lo: return 0.0
+        v = (float(x) - lo) / (hi - lo)
+        return max(0.0, min(1.0, v))
+    except Exception:
+        return 0.0
+
+def mcdm_score(c: dict, w: Dict[str, float]) -> Tuple[float, Dict[str, float]]:
+    pe = float(c.get("pe_ratio") or 0.0)
+    beta = float(c.get("beta") or 1.0)
+    vol = float(c.get("volatility") or 0.3)
+    price = float(c.get("price") or 0.0)
+    sma20 = float(c.get("sma_20") or price)
+    rsi = float(c.get("rsi") or 50.0)
+    mcap = float(c.get("market_cap") or 0.0)
+    sent = float(c.get("sentiment") or 0.0)
+
+    valuation = 0.0
+    if pe <= 0: valuation = 0.6
+    elif pe < 12: valuation = 1.0
+    elif pe < 18: valuation = 0.8
+    elif pe < 25: valuation = 0.6
+    elif pe < 35: valuation = 0.4
+    else: valuation = 0.2
+
+    risk = 0.0
+    risk += (1.0 - _norm01(beta, 0.6, 1.6)) * 0.5
+    risk += (1.0 - _norm01(vol, 0.15, 0.6)) * 0.5
+    risk = max(0.0, min(1.0, risk))
+
+    momentum = 0.0
+    if price and sma20:
+        if price > sma20: momentum += 0.6
+        if 45 <= rsi <= 65: momentum += 0.3
+        elif 35 <= rsi < 45 or 65 < rsi <= 75: momentum += 0.15
+    momentum = max(0.0, min(1.0, momentum))
+
+    size = _norm01(mcap, 5e9, 300e9)
+    sentiment = _norm01(sent, -0.6, 0.6)
+
+    feats = {"valuation": round(valuation,3), "risk": round(risk,3), "momentum": round(momentum,3),
+             "size": round(size,3), "sentiment": round(sentiment,3)}
+    score = 0.0
+    for k, v in feats.items():
+        score += v * float(w.get(k, 0.0))
+    return float(max(0.0, min(1.0, score))), feats
+
+# ───────────────────────── Translation utils ───────────────────────────
+SUPPORTED_LANGUAGES = {"bn":"Bengali","es":"Spanish","de":"German","fr":"French","it":"Italian","pt":"Portuguese","en":"English"}
 @lru_cache(maxsize=20)
 def get_translator(source_lang: str, target_lang: str):
     model_name = f"Helsinki-NLP/opus-mt-{source_lang}-{target_lang}"
@@ -700,7 +599,6 @@ def get_translator(source_lang: str, target_lang: str):
     except Exception as e:
         logger.warning(f"Translation model loading failed: {e}")
         return None
-
 
 def translate_input_to_english(text: str) -> tuple[str, str]:
     try:
@@ -717,10 +615,8 @@ def translate_input_to_english(text: str) -> tuple[str, str]:
         logger.warning(f"Translation failed: {e}")
         return text, "en"
 
-
 def translate_output_from_english(text: str, target_lang: str) -> str:
-    if target_lang == "en":
-        return text
+    if target_lang == "en": return text
     try:
         translator = get_translator("en", target_lang)
         if translator:
@@ -730,7 +626,7 @@ def translate_output_from_english(text: str, target_lang: str) -> str:
         logger.warning(f"Output translation failed: {e}")
     return text
 
-
+# ───────────────────────── PDF / Web search helpers ────────────────────────
 def extract_text_from_pdf(file_path: str) -> str:
     try:
         doc = fitz.open(file_path)
@@ -740,7 +636,6 @@ def extract_text_from_pdf(file_path: str) -> str:
     except Exception as e:
         logger.error(f"PDF extraction failed: {e}")
         return f"Error reading PDF: {str(e)}"
-
 
 def web_search_ddg(query: str, max_results: int = 3) -> str:
     try:
@@ -758,12 +653,107 @@ def web_search_ddg(query: str, max_results: int = 3) -> str:
         logger.warning(f"Web search failed: {e}")
         return "Web search temporarily unavailable."
 
+# ───────────────────────────── DB: Portfolios ──────────────────────────────
+class SecurePortfolioManager:
+    def __init__(self):
+        self.db_path = "secure_portfolios.db"
+        self.init_database()
+    def get_db_connection(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        return conn
+    def init_database(self):
+        try:
+            with self.get_db_connection() as conn:
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS portfolios (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id TEXT NOT NULL,
+                        symbol TEXT NOT NULL,
+                        shares REAL NOT NULL CHECK (shares > 0),
+                        purchase_price REAL NOT NULL CHECK (purchase_price > 0),
+                        purchase_date TEXT NOT NULL,
+                        risk_tolerance TEXT CHECK (risk_tolerance IN ('Low','Medium','High')),
+                        investment_goals TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS user_profiles (
+                        user_id TEXT PRIMARY KEY,
+                        age INTEGER CHECK (age >= 18 AND age <= 100),
+                        risk_tolerance TEXT CHECK (risk_tolerance IN ('Conservative','Moderate','Aggressive')),
+                        investment_timeline TEXT,
+                        income_level TEXT,
+                        experience_level TEXT,
+                        financial_goals TEXT,
+                        created_date TEXT,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                conn.execute("CREATE TABLE IF NOT EXISTS companies (symbol TEXT PRIMARY KEY, name TEXT, sector TEXT, market_cap REAL, pe_ratio REAL, price REAL, risk_level TEXT, beta REAL)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_portfolios_user_id ON portfolios(user_id)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_portfolios_symbol ON portfolios(symbol)")
+                conn.commit()
+        except Exception as e:
+            logger.error(f"Database initialization failed: {e}")
+    def add_to_portfolio(self, user_id: str, symbol: str, shares: float, price: float) -> bool:
+        try:
+            user_id = SecurityManager.validate_user_id(user_id)
+            symbol = re.sub(r"[^A-Z.\-]", "", symbol.upper())
+            if shares <= 0 or price <= 0:
+                raise ValueError("Shares and price must be positive")
+            with self.get_db_connection() as conn:
+                conn.execute("""
+                    INSERT INTO portfolios
+                    (user_id, symbol, shares, purchase_price, purchase_date, risk_tolerance, investment_goals)
+                    VALUES (?, ?, ?, ?, date('now'), ?, ?)
+                """, (user_id, symbol, shares, price, "Medium", "Growth"))
+                conn.commit()
+                return True
+        except Exception as e:
+            logger.error(f"Portfolio add failed: {e}")
+            return False
+    def get_portfolio_performance(self, user_id: str) -> dict:
+        try:
+            user_id = SecurityManager.validate_user_id(user_id)
+            with self.get_db_connection() as conn:
+                positions = conn.execute("""
+                    SELECT symbol, shares, purchase_price FROM portfolios WHERE user_id = ? ORDER BY created_at DESC
+                """, (user_id,)).fetchall()
+            total_value=0.0; total_cost=0.0; performance=[]
+            for symbol, shares, purchase_price in positions:
+                try:
+                    current_price = safe_latest_price(symbol)
+                    if current_price is None: continue
+                    position_value = shares * current_price
+                    position_cost = shares * purchase_price
+                    pnl = position_value - position_cost
+                    pnl_pct = (pnl / position_cost) * 100 if position_cost > 0 else 0
+                    performance.append({
+                        "symbol": symbol, "shares": shares, "current_price": round(current_price,2),
+                        "purchase_price": purchase_price, "current_value": round(position_value,2),
+                        "pnl": round(pnl,2), "pnl_pct": round(pnl_pct,2)
+                    })
+                    total_value += position_value; total_cost += position_cost
+                except Exception as e:
+                    logger.warning(f"Failed to get price for {symbol}: {e}")
+                    continue
+            return {
+                "positions": performance, "total_value": round(total_value,2), "total_cost": round(total_cost,2),
+                "total_pnl": round(total_value - total_cost,2),
+                "total_return_pct": round(((total_value - total_cost)/total_cost*100),2) if total_cost>0 else 0
+            }
+        except Exception as e:
+            logger.error(f"Portfolio performance calculation failed: {e}")
+            return {"positions": [], "total_value": 0, "total_cost": 0, "total_pnl": 0, "total_return_pct": 0}
 
-# ───────────────────────────── LLM + agents ────────────────────────────────
+# ───────────────────────────── Agent state ─────────────────────────────────
 class FinancialAgentState(TypedDict):
     query: str
     user_profile: Dict
-    user_requirements: Dict
+    user_requirements: Dict  # include flags: strict_mode, answer_style
     sql_queries: List[str]
     company_data: List[Dict]
     market_analysis: str
@@ -772,291 +762,341 @@ class FinancialAgentState(TypedDict):
     recommendations: List[Dict]
     final_response: str
 
-
-llm = ChatGroq(
-    temperature=0.1, groq_api_key=os.getenv("GROQ_API_KEY"), model_name="llama3-70b-8192"
-)
-
-
+# ───────────────────────────── LLM agents ──────────────────────────────────
 def generate_sql_agent(state: FinancialAgentState):
     query = state["query"]
     user_profile = state.get("user_profile", {})
     sql_prompt = f"""
-    Generate SQL queries for financial analysis:
-    Query: "{query}"
-    User Profile: Risk: {user_profile.get('risk_tolerance', 'Moderate')}, Timeline: {user_profile.get('investment_timeline', 'Medium-term')}
+Generate 2-3 read-only SQL queries for financial analysis (SQLite syntax).
 
-    Schema:
-    - companies (symbol, name, sector, market_cap, pe_ratio, price, risk_level, beta)
-    - portfolios (user_id, symbol, shares, purchase_price, purchase_date)
+Context:
+- Query: "{query}"
+- User Profile: Risk: {user_profile.get('risk_tolerance','Moderate')}, Timeline: {user_profile.get('investment_timeline','Medium-term')}
 
-    Generate 2-3 relevant SQL queries:
-    """
+Schema:
+- companies(symbol, name, sector, market_cap, pe_ratio, price, risk_level, beta)
+- portfolios(user_id, symbol, shares, purchase_price, purchase_date)
+
+Constraints:
+- SINGLE SELECT only
+- No JOINs outside listed tables
+- No comments
+Return queries fenced in ```sql blocks.
+""".strip()
     try:
-        response = llm.invoke([{"role": "user", "content": sql_prompt}])
-        sql_queries = re.findall(r"```sql\n(.*?)\n```", response.content, re.DOTALL)
+        resp = llm_call("sql", [{"role":"user","content":sql_prompt}], max_tries=2)
+        content = resp.content or ""
+        sql_queries = re.findall(r"```sql\s*(.*?)```", content, re.DOTALL | re.IGNORECASE)
         if not sql_queries:
-            sql_queries = [
-                "SELECT * FROM companies WHERE sector LIKE '%technology%' ORDER BY market_cap DESC;"
-            ]
-        state["sql_queries"] = sql_queries
+            sql_queries = ["SELECT * FROM companies ORDER BY market_cap DESC LIMIT 10"]
+        state["sql_queries"] = sql_queries[:3]
     except Exception as e:
         logger.error(f"SQL generation failed: {e}")
-        state["sql_queries"] = [
-            "SELECT * FROM companies ORDER BY market_cap DESC LIMIT 10;"
-        ]
+        state["sql_queries"] = ["SELECT * FROM companies ORDER BY market_cap DESC LIMIT 10"]
     return state
 
-
 def data_integration_agent(state: FinancialAgentState):
-    query = state["query"]
-    sql_queries = state.get("sql_queries", [])
-    db_path = "secure_portfolios.db"
-    all_results: List[pd.DataFrame] = []
-
+    query = state["query"]; sql_queries = state.get("sql_queries", [])
+    db_path = "secure_portfolios.db"; all_results: List[pd.DataFrame] = []
     try:
         with sqlite3.connect(db_path) as conn:
             for sql_query in sql_queries:
                 try:
-                    safe_query = SecurityManager.allowlist_sql(sql_query)
+                    safe_query = validate_sql_ast(sql_query)
                     df = pd.read_sql_query(safe_query, conn)
-                    if not df.empty:
-                        all_results.append(df)
+                    if not df.empty: all_results.append(df)
                 except Exception as e:
-                    logger.error(f"SQL execution failed for query '{sql_query}': {e}")
+                    logger.error(f"SQL execution failed: {e}")
     except Exception as e:
         logger.error(f"Database connection failed: {e}")
 
     if all_results:
-        final_df = (
-            pd.concat(all_results).drop_duplicates(subset=["symbol"]).reset_index(drop=True)
-        )
-        company_data = [
-            normalize_company_keys(r) for r in final_df.to_dict("records")
-        ]
+        final_df = pd.concat(all_results).drop_duplicates(subset=["symbol"]).reset_index(drop=True)
+        company_data = [normalize_company_keys(r) for r in final_df.to_dict("records")]
     else:
-        logger.warning("SQL queries yielded no results. Falling back to live yfinance.")
-        company_data = [
-            normalize_company_keys(x) for x in get_stocks_by_real_criteria(query)
-        ]
+        logger.warning("SQL yielded no results, falling back to live screening.")
+        company_data = [normalize_company_keys(x) for x in get_stocks_by_real_criteria(query)]
 
-    state["company_data"] = company_data[:5]
+    syms = [c["symbol"] for c in company_data]
+    live = {c["symbol"]: c for c in get_real_stock_data_parallel(syms)}
+    company_data = [{**c, **(live.get(c["symbol"], {}))} for c in company_data]
+    state["company_data"] = company_data[:6]
 
     analysis_prompt = f"""
-    Analyze these companies: {[{
-        'name': c['name'],
-        'sector': c['sector'],
-        'market_cap': f"${c.get('market_cap', 0)/1000000000:.1f}B",
-        'pe_ratio': c.get('pe_ratio', 'N/A'),
-        'price': c.get('price', 'N/A')
-    } for c in state["company_data"][:3]]}
-
-    Provide a brief market analysis (2-3 sentences) covering sector trends and general risk.
-    """
+Provide a concise (2-3 sentences) market snapshot for these companies:
+{[{'name': c['name'], 'sector': c['sector'], 'pe': c.get('pe_ratio','N/A'), 'mcap': c.get('market_cap',0)} for c in company_data[:3]]}
+Discuss sector trends and risk.
+"""
     try:
-        analysis_response = llm.invoke([{"role": "user", "content": analysis_prompt}])
-        state["market_analysis"] = analysis_response.content
+        analysis_response = llm_call("analysis", [{"role":"user","content":analysis_prompt}], max_tries=2)
+        state["market_analysis"] = analysis_response.content.strip() or "—"
     except Exception as e:
         logger.error(f"Market analysis failed: {e}")
-        state["market_analysis"] = "Market analysis is currently unavailable."
+        state["market_analysis"] = "—"
+
     return state
 
+# ───────────────────────────── 3 RAG agents ────────────────────────────────
+def qualitative_retriever_agent(state: FinancialAgentState):
+    syms = [c["symbol"] for c in state.get("company_data", [])][:5]
+    urls = set()
+    for s in syms:
+        try:
+            with DDGS() as ddgs:
+                for r in ddgs.text(f"{s} company analysis news review", max_results=5):
+                    if (r.get("href") or "").startswith("http"):
+                        urls.add(r["href"])
+        except Exception:
+            continue
+    try: add_from_urls_text(list(urls)[:12])
+    except Exception: pass
 
-def _safe(x, default=0.0):
-    try:
-        return float(x) if x is not None else default
-    except Exception:
-        return default
+    enriched = []
+    for c in state.get("company_data", []):
+        try:
+            hits = retrieve_text(f"{c.get('name') or c['symbol']} investment thesis news", k=3)
+            prov = c.get("provenance", [])
+            for h in hits[:2]:
+                prov.append({"type":"qual","title":h["title"],"url":h["url"],"date":""})
+            enriched.append({**c, "provenance": prov})
+        except Exception:
+            enriched.append(c)
+    state["company_data"] = enriched
+    return state
 
+def logical_retriever_agent(state: FinancialAgentState):
+    syms = [c["symbol"] for c in state.get("company_data", [])][:5]
+    urls = set()
+    for s in syms:
+        for q in [f"{s} press release acquisition OR merger OR financing",
+                  f"{s} site:sec.gov 8-K OR 10-K OR 10-Q"]:
+            try:
+                with DDGS() as ddgs:
+                    for r in ddgs.text(q, max_results=5):
+                        if (r.get("href") or "").startswith("http"):
+                            urls.add(r["href"])
+            except Exception:
+                continue
+    try: add_from_urls_logic(list(urls)[:15])
+    except Exception: pass
 
-def score_company(c: dict) -> dict:
-    pe = _safe(c.get("pe_ratio"))
-    beta = _safe(c.get("beta"), 1.0)
-    vol = _safe(c.get("volatility"))
-    price = _safe(c.get("price"))
-    sma20 = _safe(c.get("sma_20"), price)
-    rsi = _safe(c.get("rsi"), 50.0)
-    mcap = _safe(c.get("market_cap")) / 1e9
+    enriched=[]
+    for c in state.get("company_data", []):
+        try:
+            name = c.get("name") or c["symbol"]
+            hits = retrieve_logic(f"{name} merger acquisition financing litigation regulatory", k=5)
+            snippets = [h["snippet"] for h in hits]
+            logical = extract_logical_from_hits(snippets)
+            prov = c.get("provenance", [])
+            for h in hits[:2]:
+                prov.append({"type":"logic","title":h["title"],"url":h["url"],"date":""})
+            enriched.append({**c, "logical_facts": logical, "provenance": prov})
+        except Exception:
+            enriched.append(c)
+    state["company_data"] = enriched
+    return state
 
-    fx: Dict[str, float] = {}
-    if pe <= 0:
-        fx["valuation"] = 10
-    else:
-        if pe < 12:
-            val = 35
-        elif pe < 18:
-            val = 28
-        elif pe < 25:
-            val = 22
-        elif pe < 35:
-            val = 12
-        else:
-            val = 5
-        fx["valuation"] = val
+def numeric_retriever_agent(state: FinancialAgentState):
+    syms = [c["symbol"] for c in state.get("company_data", [])][:5]
+    try: ingest_numeric_for_symbols(syms)
+    except Exception: pass
 
-    mom = 0
-    if price and sma20:
-        if price > sma20:
-            mom += 12
-        if 45 <= rsi <= 65:
-            mom += 10
-        elif 35 <= rsi < 45 or 65 < rsi <= 75:
-            mom += 6
-    fx["momentum"] = mom
+    enriched = []
+    for c in state.get("company_data", []):
+        try:
+            num_hits = numeric_retrieve("revenue eps free cash flow debt", [c["symbol"]], topk=5)
+            prov = list(c.get("provenance", []))
+            numeric_facts=[]
+            for nh in num_hits:
+                numeric_facts.append({"metric": nh["metric"], "period": nh["period"], "value": nh["value"]})
+                prov.append({"type":"numeric","title": nh.get("title",""), "url": nh.get("url",""), "date": nh.get("period","")})
+            eps_guess = next((f["value"] for f in numeric_facts if "eps" in f["metric"]), None)
+            enriched.append({**c, "numeric_facts": numeric_facts, "eps": c.get("eps") or eps_guess, "provenance": prov})
+        except Exception:
+            enriched.append(c)
+    state["company_data"] = enriched
+    return state
 
-    risk_pts = 0
-    if beta < 0.9:
-        risk_pts += 12
-    elif beta < 1.1:
-        risk_pts += 8
-    elif beta < 1.3:
-        risk_pts += 4
-    if vol:
-        if vol < 0.25:
-            risk_pts += 13
-        elif vol < 0.35:
-            risk_pts += 8
-        elif vol < 0.5:
-            risk_pts += 3
-    fx["risk"] = risk_pts
+# ─────────────────────────── Verifier / Recommender ────────────────────────
+def _meets_provenance_gate(prov: List[dict]) -> bool:
+    t = {p.get("type") for p in (prov or [])}
+    return ("numeric" in t) and any(x in t for x in {"news","logic"})
 
-    size = 0
-    if mcap >= 200:
-        size = 10
-    elif mcap >= 50:
-        size = 7
-    elif mcap >= 10:
-        size = 4
-    fx["size"] = size
+def verifier_agent(state: FinancialAgentState):
+    enriched=[]
+    for c in state.get("company_data", []):
+        vr = numeric_verification(c)
+        prov = c.get("provenance", [])
+        news_n = sum(1 for p in prov if p.get("type")=="news")
+        qual_n = sum(1 for p in prov if p.get("type")=="qual")
+        logic_n= sum(1 for p in prov if p.get("type")=="logic")
+        num_n  = sum(1 for p in prov if p.get("type")=="numeric")
+        conf = 0.25*(1.0 if vr["numeric_ok"] else 0.3) + 0.25*min(1.0, news_n/4.0) + 0.25*min(1.0, (qual_n+logic_n)/4.0) + 0.25*min(1.0, num_n/3.0)
+        enriched.append({**c, "verify_numeric_ok": vr["numeric_ok"], "verify_error": vr["numeric_err"], "confidence": round(conf,2)})
+    state["company_data"] = enriched
+    return state
 
-    score = round(sum(fx.values()), 1)
-    return {"score": score, "factors": {k: round(v, 1) for k, v in fx.items()}}
+class Recommendation(BaseModel):
+    company: str
+    symbol: str
+    sector: str
+    price: float = Field(ge=0)
+    pe_ratio: float | None = None
+    market_cap: float | None = None
+    risk: str | None = None
+    score: float = Field(ge=0.0, le=1.0)
+    features: Dict[str, float]
+    confidence: float = Field(ge=0.0, le=1.0)
+    flags: List[str] = []
+    rationale: str
+    sources: List[Dict[str, str]] = []
 
-
-def softmax_weights(scores: List[float], cap: float = 0.6) -> List[float]:
-    import math
-
-    if not scores:
-        return []
-    mx = max(scores) or 1.0
-    exps = [math.exp(s / mx) for s in scores]
-    ssum = sum(exps) or 1.0
-    w = [e / ssum for e in exps]
-    w = [min(x, cap) for x in w]
-    ssum = sum(w) or 1.0
-    return [round(x / ssum, 4) for x in w]
-
+def validate_recommendations(items: List[dict]) -> List[dict]:
+    out=[]
+    for it in items:
+        try:
+            v = Recommendation(**it)
+            out.append(v.dict())
+        except ValidationError:
+            continue
+    return out
 
 def recommendation_agent(state: FinancialAgentState):
     companies = state["company_data"]
-    analysis = state["market_analysis"]
+    analysis = state.get("market_analysis", "—")
     query = state["query"]
+    req = state.get("user_requirements", {}) or {}
+    strict_mode = bool(req.get("strict_mode", False))
+    weights = req.get("weights") or {"valuation":0.25,"risk":0.30,"momentum":0.20,"size":0.15,"sentiment":0.10}
+    s = sum(weights.values()) or 1.0
+    weights = {k: float(v)/s for k,v in weights.items()}
+    profile = state.get("user_profile", {})
 
-    scored = []
-    for c in companies[:5]:
-        sc = score_company(c)
-        scored.append({**c, **sc})
+    ranked=[]; excluded=[]
+    for c in companies[:8]:
+        prov = c.get("provenance", [])
+        if strict_mode and not _meets_provenance_gate(prov):
+            excluded.append({"symbol": c.get("symbol"), "reason": "insufficient_provenance"}); continue
 
-    weights = softmax_weights([x["score"] for x in scored], cap=0.6)
-    for i, w in enumerate(weights):
-        scored[i]["weight"] = w
+        gate = check_constraints(c, profile)
+        rules = apply_rules(c, profile)
+        if rules["blocked"]:
+            excluded.append({"symbol": c.get("symbol"), "reason": "policy_block", "flags": rules["flags"]}); continue
 
-    recs = []
-    for x in scored[:3]:
-        alloc_pct = f"{round(x['weight'] * 100):d}%"
+        score, feats = mcdm_score(c, weights)
+        score = max(0.0, min(1.0, score + rules["boost"] - (0.15 if not gate["allowed"] else 0.0)))
+
+        news = [p for p in prov if p.get("type")=="news"][:2]
+        qual = [p for p in prov if p.get("type")=="qual"][:1]
+        logic= [p for p in prov if p.get("type")=="logic"][:1]
+        num  = [p for p in prov if p.get("type")=="numeric"][:1]
+        sources = news + qual + logic + num
+
         rationale = (
-            f"PE={x.get('pe_ratio')} • Beta={x.get('beta')} • "
-            f"Vol≈{x.get('volatility')} • RSI={x.get('rsi')} • "
-            f"Trend={x.get('trend')}"
+            f"PE={c.get('pe_ratio')} • Beta={c.get('beta')} • Vol≈{c.get('volatility')} • "
+            f"RSI={c.get('rsi')} • Trend={c.get('trend')} • Sent={c.get('sentiment',0):+.2f} • "
+            f"Conf={c.get('confidence',0):.2f}"
         )
-        why = ", ".join(
-            f"{k}:{v}"
-            for k, v in sorted(x["factors"].items(), key=lambda kv: -kv[1])
-            if v > 0
-        )
-        recs.append(
-            {
-                "company": x["name"],
-                "symbol": x["symbol"],
-                "sector": x["sector"],
-                "allocation": alloc_pct,
-                "price": x["price"],
-                "risk": x["risk"],
-                "pe_ratio": x["pe_ratio"],
-                "market_cap": x["market_cap"],
-                "score": x["score"],
-                "explain": x["factors"],
-                "rationale": rationale,
-                "why": why,
-            }
-        )
+        ranked.append({
+            "company": c["name"], "symbol": c["symbol"], "sector": c["sector"],
+            "price": c["price"], "pe_ratio": c.get("pe_ratio"), "market_cap": c.get("market_cap"),
+            "risk": c.get("risk"), "score": score, "features": feats, "confidence": c.get("confidence",0.0),
+            "flags": list(set((gate["flags"] or []) + rules["flags"])), "rationale": rationale,
+            "sources": [{"title":s.get("title",""),"url":s.get("url",""),"date":s.get("date","")} for s in sources if s.get("url")],
+        })
 
-    lines = [f"**Market Analysis:** {analysis}\n", f"**Query:** {query}\n", "**Top Picks (data-backed):**"]
-    for r in recs:
+    ranked = validate_recommendations(ranked)
+    ranked.sort(key=lambda x: (x["score"], x["confidence"]), reverse=True)
+    top = ranked[:3]
+
+    def sensitivity_stability():
+        if not top: return 0.0
+        base_top = top[0]["symbol"]; flips=0; trials=0
+        for k in weights:
+            trials += 1
+            w2 = {kk:(vv*1.1 if kk==k else vv) for kk,vv in weights.items()}
+            s2 = sum(w2.values()) or 1.0
+            w2 = {kk:vv/s2 for kk,vv in w2.items()}
+            sims=[]
+            for item in ranked:
+                s = sum(item["features"][kk]*w2.get(kk,0.0) for kk in item["features"])
+                sims.append((item["symbol"], s))
+            sims.sort(key=lambda x: x[1], reverse=True)
+            if sims and sims[0][0] != base_top: flips += 1
+        return round(1.0 - (flips/max(1,trials)), 2)
+    stability = sensitivity_stability()
+
+    lines = [
+        f"**Market Analysis:** {analysis}",
+        f"**Query:** {query}",
+        f"**Weights:** {weights} | **Rank stability (±10%/weight):** {stability}",
+        "**Top Picks (weighted + confidence + constraints + sources):**",
+    ]
+    for r in top:
+        src_str = " ; ".join(f"[{i+1}]({s['url']}) {s.get('date','')}" for i,s in enumerate(r["sources"]))
+        flag_str = f" | Flags: {', '.join(r['flags'])}" if r["flags"] else ""
         lines.append(
-            f"- **{r['company']}** ({r['symbol']}) — {r['allocation']} "
-            f"| ${r['price']:.2f} | PE {r['pe_ratio']} | "
-            f"MktCap ${r['market_cap']/1e9:.1f}B | Risk {r['risk']} | Score {r['score']}/100"
+            f"- **{r['company']}** ({r['symbol']}) — score {r['score']:.3f} | "
+            f"${r['price']:.2f} | PE {r.get('pe_ratio')} | MktCap ${ (r.get('market_cap') or 0)/1e9:.1f}B | "
+            f"Risk {r.get('risk','?')} | Conf {r['confidence']:.2f}{flag_str}"
         )
-        lines.append(f"  • Why: {r['why']}")
+        if src_str: lines.append(f"  • Sources: {src_str}")
+        lines.append(f"  • Features: {r['features']}")
         lines.append(f"  • Stats: {r['rationale']}")
-    final = "\n".join(lines)
 
-    state["recommendations"] = recs
-    state["final_response"] = final
+    if excluded:
+        why=[]
+        for ex in excluded[:3]:
+            reason = ex.get("reason")
+            if reason == "insufficient_provenance": why.append(f"{ex['symbol']}: insufficient provenance")
+            elif reason == "policy_block": why.append(f"{ex['symbol']}: blocked by policy ({', '.join(ex.get('flags', []))})")
+        if why:
+            lines.append("\n**Not recommended (reasons):** " + " | ".join(why))
+
+    state["recommendations"] = top
+    state["final_response"] = "\n".join(lines)
     return state
 
-
+# ───────────────────────────── Workflow graph ──────────────────────────────
 def create_financial_workflow():
     workflow = StateGraph(FinancialAgentState)
     workflow.add_node("sql_agent", generate_sql_agent)
     workflow.add_node("data_agent", data_integration_agent)
+    workflow.add_node("qual_retriever", qualitative_retriever_agent)
+    workflow.add_node("logic_retriever", logical_retriever_agent)
+    workflow.add_node("numeric_retriever", numeric_retriever_agent)
+    workflow.add_node("verifier_agent", verifier_agent)
     workflow.add_node("recommendation_agent", recommendation_agent)
+
     workflow.set_entry_point("sql_agent")
     workflow.add_edge("sql_agent", "data_agent")
-    workflow.add_edge("data_agent", "recommendation_agent")
+    workflow.add_edge("data_agent", "qual_retriever")
+    workflow.add_edge("qual_retriever", "logic_retriever")
+    workflow.add_edge("logic_retriever", "numeric_retriever")
+    workflow.add_edge("numeric_retriever", "verifier_agent")
+    workflow.add_edge("verifier_agent", "recommendation_agent")
     workflow.add_edge("recommendation_agent", END)
     return workflow.compile()
 
-
+# ─────────────────────────── Intent & formatting ───────────────────────────
 def is_financial_query(query: str) -> bool:
     q = query.lower()
-    financial_keywords = [
-        "stock",
-        "portfolio",
-        "market",
-        "buy",
-        "sell",
-        "recommendation",
-        "risk",
-        "return",
-        "shares",
-        "p/e",
-        "market cap",
-        "dividend",
-        "investment",
-        "ticker",
-    ]
-    if any(k in q for k in financial_keywords):
-        return True
-    if re.search(r"\b[A-Z]{1,5}\b", query):
-        return True
+    financial_keywords = ["stock","portfolio","market","buy","sell","recommendation","risk","return","shares","p/e","market cap","dividend","investment","ticker"]
+    if any(k in q for k in financial_keywords): return True
+    if re.search(r"\b[A-Z]{1,5}\b", query): return True
     if "company" in q or "safe" in q:
-        return any(k in q for k in ["stock", "investment", "p/e", "market"])
+        return any(k in q for k in ["stock","investment","p/e","market"])
     return False
-
 
 def detect_intent(query: str) -> str:
     q = query.lower()
-    if any(w in q for w in ["buy", "add", "purchase"]):
+    if any(w in q for w in ["buy","add","purchase"]):
         if re.search(r"buy\s+([\d.,]+)\s+shares?\s+of\s+([A-Za-z.\-]{1,7})", query, re.IGNORECASE):
             return "add_to_portfolio"
     if re.search(r"\b((my\s+)?portfolio|holdings|performance)\b", q):
         return "view_portfolio"
-    if is_financial_query(query):
-        return "financial_analysis"
+    if is_financial_query(query): return "financial_analysis"
     return "general_query"
-
 
 def format_portfolio_response(perf: dict) -> str:
     if not perf or not perf.get("positions"):
@@ -1068,124 +1108,123 @@ def format_portfolio_response(perf: dict) -> str:
     response += "#### Individual Holdings:\n"
     for p in perf["positions"]:
         pnl_emoji = "📈" if p["pnl"] > 0 else "📉" if p["pnl"] < 0 else "➖"
-        cp = p.get("current_price")
-        cp_str = f"${cp:.2f}" if cp is not None else "—"
+        cp = p.get("current_price"); cp_str = f"${cp:.2f}" if cp is not None else "—"
         response += f"**{p['symbol']}** - {p['shares']} shares\n"
         response += f"  • Current: {cp_str} | Purchase: ${p['purchase_price']:.2f}\n"
         response += f"  • Value: ${p['current_value']:,.2f} | P&L: {pnl_emoji} ${p['pnl']:+,.2f} ({p['pnl_pct']:+.2f}%)\n\n"
     return response
 
-
 def validate_query(query: str) -> str:
-    if not query or len(query.strip()) == 0:
-        raise ValueError("Query cannot be empty")
-    if len(query) > 2000:
-        raise ValueError("Query too long (max 2000 characters)")
+    if not query or len(query.strip()) == 0: raise ValueError("Query cannot be empty")
+    if len(query) > 2000: raise ValueError("Query too long (max 2000 characters)")
     q = query.strip()
     q = re.sub(r"<[^>]+>", "", q)
     q = re.sub(r"javascript:", "", q, flags=re.IGNORECASE)
     return q
 
-
-def handle_general_query_with_search(
-    query: str, context: str, chat_history: List[Dict[str, str]], file_path: Optional[str] = None
-) -> str:
-    should_search = any(
-        k in query.lower()
-        for k in ["company", "startup", "recent", "news", "current", "today", "latest", "what is", "who is", "tell me about"]
-    )
+def handle_general_query_with_search(query: str, context: str, chat_history: List[Dict[str, str]], file_path: Optional[str] = None) -> str:
+    should_search = any(k in query.lower() for k in ["company","startup","recent","news","current","today","latest","what is","who is","tell me about"])
     web_results = web_search_ddg(query, max_results=3) if should_search else ""
-    history_text = "\n".join(
-        f"User: {m['user']}\nAgent: {m['agent']}" for m in chat_history[-3:]
-    )
+    history_text = "\n".join(f"User: {m['user']}\nAgent: {m['agent']}" for m in chat_history[-3:])
     file_summary = extract_text_from_pdf(file_path) if file_path else ""
-    full_prompt = f"""
-    You are a professional, helpful AI assistant. Provide clear and accurate responses.
+    prompt = f"""
+You are a helpful AI assistant. Provide clear, accurate responses grounded in sources if given.
 
-    {'Previous conversation context:\n' + context + '\n' if context else ''}
-    {'Recent chat history:\n' + history_text + '\n' if history_text else ''}
-    {'File content summary:\n' + file_summary + '\n' if file_summary else ''}
-    {'Current web search results:\n' + web_results + '\n' if web_results else ''}
+{'Previous conversation context:\n' + context + '\n' if context else ''}
+{'Recent chat history:\n' + history_text + '\n' if history_text else ''}
+{'File content summary:\n' + file_summary + '\n' if file_summary else ''}
+{'Current web search results:\n' + web_results + '\n' if web_results else ''}
 
-    User's question: {query}
+User's question: {query}
 
-    Instructions:
-    1. Use the web search results if available to provide accurate, up-to-date information
-    2. If asking about a specific company/organization, prioritize the web search results
-    3. Be direct and specific, not generic
-    4. If the web results are relevant, cite them in your response
-    5. Keep response concise and focused
-
-    Answer:
-    """
+Instructions:
+1) Use search results if available and cite with URLs.
+2) Be direct and concise.
+Answer:
+""".strip()
     try:
-        return llm.invoke([{"role": "user", "content": full_prompt}]).content
+        return llm_call("analysis", [{"role":"user","content":prompt}], max_tries=2).content
     except Exception as e:
         logger.error(f"LLM request failed: {e}")
-        return "I apologize, but I'm experiencing technical difficulties. Please try again in a moment."
+        return "I’m having trouble answering that right now."
 
+# ────────────────────────── Public entrypoint ───────────────────────────────
+portfolio_manager = SecurePortfolioManager()
+def initialize_global_instances():
+    global rate_limiter, conversation_memory
+    if rate_limiter is None:
+        rate_limiter = RateLimiter()
+    if conversation_memory is None:
+        conversation_memory = ConversationMemory()
 
-# ────────────────────────── Public entrypoint ──────────────────────────────
+def render_simple(state: FinancialAgentState) -> str:
+    recs = state.get("recommendations", [])
+    tl = "Watch"
+    why = "mixed setup"
+    if recs:
+        top = recs[0]
+        tl = "Buy" if top["score"] >= 0.65 and top["confidence"] >= 0.6 else "Watch" if top["score"] >= 0.5 else "Avoid"
+        why = f"valuation {top['features']['valuation']:.2f}, risk {top['features']['risk']:.2f}, momentum {top['features']['momentum']:.2f}"
+    snap = state.get("company_data", [{}])[0] if state.get("company_data") else {}
+    pe = snap.get("pe_ratio"); beta = snap.get("beta"); rsi = snap.get("rsi"); sent = snap.get("sentiment",0.0)
+    trend = "above 20-day MA" if snap.get("trend") == "Bullish" else "below 20-day MA"
+    return f"""**TL;DR:** **{tl}** (non-advice). Why: {why}.
+
+**Fundamentals**
+- EPS: {'positive' if (snap.get('eps') or 0) > 0 else 'negative or n/a'}
+- Valuation: P/E ~ {pe or 'n/a'} (cheap <15, fair 15–25, rich >25)
+- Cash flow: {'positive' if any(f.get('metric','').startswith('free_cash_flow') for f in snap.get('numeric_facts',[])) else 'n/a'}
+- Balance sheet: Debt/FCF check: {'ok' if any('free_cash_flow' in (f.get('metric','')) for f in snap.get('numeric_facts',[])) else 'needs review'}
+
+**Market & Macro**
+- Sector: {snap.get('sector','n/a')}
+- Rate sensitivity (β): {beta if beta is not None else 'n/a'}
+
+**Technical (timing)**
+- Trend: {trend}
+- Momentum: RSI ~ {rsi if rsi else 'n/a'} (45–65 healthy)
+- Volatility/Beta: {'low' if (beta or 1) < 0.9 else 'high' if (beta or 1) > 1.2 else 'medium'}
+
+**Qualitative**
+- News sentiment: {'positive' if sent > 0.1 else 'mixed' if -0.1 <= sent <= 0.1 else 'negative'}
+- Flags: {', '.join(snap.get('logical_facts', {}).keys()) or 'none seen'}
+"""
+
 def run_customer_support(
     query: str,
     force_language: Optional[str] = None,
     chat_history: Optional[List[Dict[str, str]]] = None,
     file_path: Optional[str] = None,
     user_id: str = "anonymous_user",
+    answer_style: str = "simple",
+    strict_mode: bool = True,
+    fast_mode: bool = False,
 ) -> Dict[str, Any]:
-    if chat_history is None:
-        chat_history = []
-
-    # Initialize global singletons
+    if chat_history is None: chat_history = []
     initialize_global_instances()
-
-    # Rate limit
     allowed, remaining = rate_limiter.is_allowed(user_id)
     if not allowed:
-        return {
-            "original_language": "English",
-            "response": "⚠️ Rate limit exceeded. Please try again later or upgrade to premium.",
-            "raw_response": "Rate limit exceeded",
-        }
+        return {"original_language": "English","response":"⚠️ Rate limit exceeded. Please try again later.","raw_response":"Rate limit exceeded","remaining_requests":0}
 
-    # Validate + translate input
     try:
         query = validate_query(query)
     except ValueError as e:
-        return {
-            "original_language": "English",
-            "response": f"❌ Invalid input: {str(e)}",
-            "raw_response": str(e),
-        }
+        return {"original_language":"English","response":f"❌ Invalid input: {str(e)}","raw_response":str(e),"remaining_requests":remaining}
 
     translated_query, detected_lang = translate_input_to_english(query)
-
-    # Context
     context = conversation_memory.get_context_summary(user_id)
-
-    # Intent
     intent = detect_intent(translated_query)
 
     if intent == "add_to_portfolio":
-        m = re.search(
-            r"buy\s+([\d.,]+)\s+shares?\s+of\s+([A-Za-z.\-]{1,7})",
-            translated_query,
-            re.IGNORECASE,
-        )
+        m = re.search(r"buy\s+([\d.,]+)\s+shares?\s+of\s+([A-Za-z.\-]{1,7})", translated_query, re.IGNORECASE)
         if m:
             shares_str, symbol = m.groups()
             try:
                 current_price = safe_latest_price(symbol.upper())
-                if current_price is None:
-                    raise ValueError("price unavailable")
+                if current_price is None: raise ValueError("price unavailable")
                 shares = float(shares_str.replace(",", ""))
-                success = portfolio_manager.add_to_portfolio(
-                    user_id, symbol.upper(), shares, current_price
-                )
-                if success:
-                    response = f"✅ Added {shares:g} shares of {symbol.upper()} at ${current_price:.2f} per share."
-                else:
-                    response = "❌ Failed to add to portfolio. Please try again."
+                success = portfolio_manager.add_to_portfolio(user_id, symbol.upper(), shares, current_price)
+                response = f"✅ Added {shares:g} shares of {symbol.upper()} at ${current_price:.2f} per share." if success else "❌ Failed to add to portfolio. Please try again."
             except Exception:
                 response = f"❌ Error: Could not fetch a reliable price for '{symbol}'."
         else:
@@ -1196,11 +1235,12 @@ def run_customer_support(
         response = format_portfolio_response(performance_data)
 
     elif intent == "financial_analysis":
+        t0 = time.time()
         workflow = create_financial_workflow()
         initial_state: FinancialAgentState = {
             "query": translated_query,
             "user_profile": {},
-            "user_requirements": {},
+            "user_requirements": {"strict_mode": strict_mode, "answer_style": answer_style},
             "sql_queries": [],
             "company_data": [],
             "market_analysis": "",
@@ -1209,40 +1249,38 @@ def run_customer_support(
             "recommendations": [],
             "final_response": "",
         }
-        try:
-            result = workflow.invoke(initial_state)
-            response = result["final_response"]
-            demo_info = (
-                "\n\n🔧 **Live Financial Analysis System:**\n"
-                f"**SQL Queries Generated:** {len(result['sql_queries'])}\n"
-                "**Real-time Data Sources:** Yahoo Finance, Live Market Data\n"
-                f"**Companies Analyzed:** {len(result['company_data'])}\n"
-                f"**Recommendations:** {len(result['recommendations'])}\n\n"
-                "**Live Stock Recommendations:**\n"
-            )
-            for i, rec in enumerate(result["recommendations"], 1):
-                demo_info += (
-                    f"{i}. **{rec['company']}** ({rec['symbol']}) - ${rec['price']}/share\n"
-                    f"   • {rec['allocation']} allocation, {rec['risk']} risk\n"
-                    f"   • {rec['rationale']}\n\n"
-                )
-            response += demo_info
-        except Exception as e:
-            logger.error(f"Financial workflow failed: {e}")
-            response = "Sorry, the financial analysis system is temporarily unavailable. Please try again later."
-    else:
-        response = handle_general_query_with_search(
-            translated_query, context, chat_history, file_path
-        )
 
-    # Memory + translation
+        # Budget-aware pipeline:
+        state = initial_state
+        state = generate_sql_agent(state)
+        state = data_integration_agent(state)
+
+        # Early-exit / fast mode:
+        sufficient = all(_meets_provenance_gate(c.get("provenance", [])) for c in state.get("company_data", []))
+        time_left_ms = AGENT_BUDGET_MS - int((time.time() - t0) * 1000)
+
+        if fast_mode or sufficient or time_left_ms < 4000:
+            state = verifier_agent(state)
+            state = recommendation_agent(state)
+        else:
+            state = qualitative_retriever_agent(state)
+            state = logical_retriever_agent(state)
+            state = numeric_retriever_agent(state)
+            state = verifier_agent(state)
+            state = recommendation_agent(state)
+
+        if answer_style == "simple":
+            response = render_simple(state)
+        elif answer_style == "balanced":
+            response = render_simple(state) + "\n\n---\n" + state["final_response"]
+        else:
+            response = state["final_response"]
+    else:
+        response = handle_general_query_with_search(translated_query, context, chat_history, file_path)
+
     conversation_memory.add_exchange(user_id, query, response)
     target_lang = force_language if force_language else detected_lang
     translated_response = translate_output_from_english(response, target_lang)
 
-    return {
-        "original_language": SUPPORTED_LANGUAGES.get(detected_lang, detected_lang),
-        "response": translated_response,
-        "raw_response": response,
-        "remaining_requests": remaining,
-    }
+    return {"original_language": SUPPORTED_LANGUAGES.get(detected_lang, detected_lang),
+            "response": translated_response, "raw_response": response, "remaining_requests": remaining}
