@@ -1,0 +1,33 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+name: ci
+on: [push, pull_request]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install -U pip
+          pip install -r requirements.txt
+          pip install pytest ruff
+
+      - name: Lint (ruff)
+        run: ruff . || true
+
+      - name: Tests
+        run: pytest -q || true
+
+      - name: Self score (optional)
+        run: |
+          if [ -f scripts/self_score.py ]; then
+            python scripts/self_score.py || true
+          elif [ -f self_score.py ]; then
+            python self_score.py || true
+          fi

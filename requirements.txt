@@ -1,0 +1,45 @@
+# --- Core app ---
+streamlit~=1.48
+python-dotenv~=1.1
+
+# --- Data / finance / HTML parsing ---
+pandas~=2.3
+numpy~=1.26
+yfinance<0.2.50,>=0.2.38
+requests<2.33,>=2.31
+beautifulsoup4~=4.13
+lxml>=5.1,<6
+html5lib~=1.1
+requests-cache~=1.2
+
+# --- Agent orchestration ---
+langgraph<0.3,>=0.2.20
+
+# --- NLP & translation ---
+transformers<4.43,>=4.41
+sentencepiece>=0.1.99
+langdetect~=1.0.9
+torch<2.4,>=2.2
+
+# --- PDF processing ---
+PyMuPDF<1.26,>=1.24  # package name is PyMuPDF even though you import fitz
+
+# --- Web search ---
+duckduckgo-search~=5.1
+
+# --- Sentiment (FinBERT primary; VADER optional fallback) ---
+vaderSentiment==3.3.2
+
+# --- RAG / parsing / validation ---
+sentence-transformers<2.9,>=2.7
+trafilatura<2.1,>=2.0
+sqlglot<24.5,>=24.1
+pydantic<2.9,>=2.8
+
+# --- Audio I/O (optional) ---
+gTTS<2.6,>=2.5
+streamlit-mic-recorder<0.1,>=0.0.8
+faster-whisper<0.12,>=0.10
+
+# --- Optional FAISS (skip on Windows, use fallback) ---
+faiss-cpu>=1.8.0; platform_system != "Windows"

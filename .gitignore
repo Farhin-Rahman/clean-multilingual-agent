@@ -1,0 +1,8 @@
+﻿venv/
+__pycache__/
+*.pyc
+.env
+*.env
+*.db
+sp500_full_cache.csv
+.DS_Store
