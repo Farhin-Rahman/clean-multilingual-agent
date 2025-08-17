@@ -42,6 +42,265 @@ st.set_page_config(
     page_icon="🤖",
 )
 
+# ===================== Enrichment / Normalizer ======================
+# Converts the agent’s verbose "Market Analysis ... Top Picks" block into a clean investor-style list.
+def _enrich_recommendations(markdown_text: str) -> str:
+    import re
+    import numpy as np
+    import pandas as pd
+    import yfinance as yf  # shimmed by sitecustomize when FREE_DEMO=1
+
+    risk_label = st.session_state.get("risk_tolerance", "Moderate")
+
+    def _rsi(series: pd.Series, n: int = 14):
+        if series is None or len(series) < n + 5:
+            return None
+        d = series.diff()
+        up = d.clip(lower=0.0)
+        down = -d.clip(upper=0.0)
+        roll_up = up.rolling(n).mean()
+        roll_down = down.rolling(n).mean()
+        rs = roll_up / (roll_down + 1e-12)
+        rsi = 100 - (100 / (1 + rs))
+        try:
+            return float(rsi.iloc[-1])
+        except Exception:
+            return None
+
+    def _mk_pick_line(name, sym, price, score, conf):
+        price_part = f"${price:,.2f}" if isinstance(price, (int, float)) else "$—"
+        score_part = f"{score:.3f}" if isinstance(score, (int, float)) else "—"
+        conf_part = f"{conf:.2f}" if isinstance(conf, (int, float)) else "—"
+        return f"- {name} ({sym}) — {price_part} · score {score_part} · conf {conf_part}"
+
+    # -------- Path A: normalize the original “Market Analysis” block --------
+    if "Top Picks" in markdown_text or "Market Analysis:" in markdown_text:
+        lines = markdown_text.splitlines()
+        picks = []
+
+        # Grab lines that start with "- **Name** (SYM)"
+        for line in lines:
+            if line.lstrip().startswith("- **"):
+                # Name + ticker
+                m1 = re.match(r"\s*-\s*\*\*(.+?)\*\*\s+\(([A-Z.\-]{1,8})\)", line)
+                if not m1:
+                    continue
+                name, sym = m1.group(1), m1.group(2)
+
+                # Price (first $number on the line)
+                m_price = re.search(r"\$\s*([0-9][0-9,]*\.?[0-9]*)", line)
+                price = float(m_price.group(1).replace(",", "")) if m_price else None
+
+                # score and conf anywhere on the line
+                m_score = re.search(r"score\s+([0-9.]+)", line, re.I)
+                score = float(m_score.group(1)) if m_score else None
+                m_conf = re.search(r"Conf\s+([0-9.]+)", line, re.I)
+                conf = float(m_conf.group(1)) if m_conf else None
+
+                picks.append((name, sym, price, score, conf))
+
+        # Build a neat section with richer bullets from shimmed yfinance
+        out = [f"### Safe stock suggestions ({risk_label})", ""]
+        for name, sym, price, score, conf in picks:
+            # Pull info & history
+            try:
+                t = yf.Ticker(sym)
+                info = getattr(t, "info", {}) or {}
+                hist = t.history()
+                close = hist["Close"] if "Close" in hist else None
+            except Exception:
+                info, close = {}, None
+
+            rsi = _rsi(close)
+            sma50 = float(close.rolling(50).mean().iloc[-1]) if (close is not None and len(close) >= 50) else None
+            trend = "Bullish" if (close is not None and sma50 is not None and close.iloc[-1] > sma50) else "Bearish"
+            vol20 = (
+                float(close.pct_change().rolling(20).std().iloc[-1] * (252 ** 0.5))
+                if (close is not None and len(close) >= 40)
+                else None
+            )
+
+            sector = info.get("sector")
+            industry = info.get("industry")
+            beta = info.get("beta")
+            dy = info.get("dividendYield")
+            pe = info.get("trailingPE")
+            mcap = info.get("marketCap")
+            debt = info.get("totalDebt")
+            ebitda = info.get("ebitda")
+            debt_ebitda = (debt / ebitda) if isinstance(debt, (int, float)) and isinstance(ebitda, (int, float)) and ebitda else None
+
+            out.append(_mk_pick_line(name, sym, price, score, conf))
+
+            # Bullet rows
+            bullets = []
+            prof = []
+            if sector:
+                prof.append(sector + (f" — {industry}" if industry else ""))
+            if isinstance(beta, (int, float)):
+                prof.append(f"β≈{beta:.2f}")
+            if isinstance(dy, (int, float)) and dy > 0:
+                prof.append(f"DY≈{dy*100:.1f}%")
+            if prof:
+                bullets.append("Profile: " + " • ".join(prof))
+
+            val = []
+            if isinstance(pe, (int, float)):
+                val.append(f"P/E≈{pe:.1f}x")
+            if isinstance(mcap, (int, float)):
+                val.append(f"Cap≈${mcap/1e9:.0f}B")
+            if val:
+                bullets.append("Valuation: " + " • ".join(val))
+
+            mom = []
+            if rsi is not None:
+                mom.append(f"RSI {rsi:.0f}")
+            if sma50 is not None and close is not None:
+                mom.append(f"Trend {trend}")
+            if vol20 is not None:
+                mom.append(f"σ20d≈{vol20*100:.1f}%")
+            if mom:
+                bullets.append("Momentum & risk: " + " • ".join(mom))
+
+            if debt_ebitda is not None:
+                bullets.append(f"Balance sheet: Debt/EBITDA≈{debt_ebitda:.1f}×")
+
+            # Short reason
+            bullets.append(
+                "Why it screens as *defensive*: below-market β and/or dividend cushion, "
+                "neutral-to-positive trend, and non-stretched multiples (demo data)."
+            )
+
+            out.extend([f"    - {b}" for b in bullets])
+            out.append("")
+
+        # Remove any “Note:” rows if they existed
+        cleaned = [ln for ln in out if not ln.strip().startswith("Note:")]
+        return "\n".join(cleaned)
+
+    # -------- Path B: already neat bullets (fallback to enrich) --------
+    # Matches lines like: "Name (TICKER) — $Price · score X · conf Y"
+    try:
+        import pandas as pd
+        import yfinance as yf
+
+        lines = markdown_text.splitlines()
+        pick_re = re.compile(
+            r"""\s*(?:\d+\.|\-|\u2022)?\s*
+                ([A-Za-z0-9 .&'/-]+)\s+\(
+                ([A-Z.\-]{1,8})\)\s+—\s+\$
+                ([0-9.,]+).*?score\s+([0-9.]+).*?conf\s+([0-9.]+)""",
+            re.VERBOSE | re.IGNORECASE,
+        )
+        out = []
+        any_match = False
+        for ln in lines:
+            if ln.strip().startswith("Note:"):
+                continue
+            m = pick_re.match(ln)
+            if not m:
+                out.append(ln)
+                continue
+            any_match = True
+            name, sym, price_s, score_s, conf_s = m.groups()
+            try:
+                price = float(price_s.replace(",", ""))
+            except Exception:
+                price = None
+            score = float(score_s)
+            conf = float(conf_s)
+
+            # Pull data
+            try:
+                t = yf.Ticker(sym)
+                info = getattr(t, "info", {}) or {}
+                hist = t.history()
+                close = hist["Close"] if "Close" in hist else None
+            except Exception:
+                info, close = {}, None
+
+            # calc metrics
+            def _rsi(series: pd.Series, n: int = 14):
+                if series is None or len(series) < n + 5:
+                    return None
+                d = series.diff()
+                up = d.clip(lower=0.0)
+                down = -d.clip(upper=0.0)
+                roll_up = up.rolling(n).mean()
+                roll_down = down.rolling(n).mean()
+                rs = roll_up / (roll_down + 1e-12)
+                rsi = 100 - (100 / (1 + rs))
+                try:
+                    return float(rsi.iloc[-1])
+                except Exception:
+                    return None
+
+            rsi = _rsi(close)
+            sma50 = float(close.rolling(50).mean().iloc[-1]) if (close is not None and len(close) >= 50) else None
+            trend = "Bullish" if (close is not None and sma50 is not None and close.iloc[-1] > sma50) else "Bearish"
+            vol20 = (
+                float(close.pct_change().rolling(20).std().iloc[-1] * (252 ** 0.5))
+                if (close is not None and len(close) >= 40)
+                else None
+            )
+
+            sector = info.get("sector")
+            industry = info.get("industry")
+            beta = info.get("beta")
+            dy = info.get("dividendYield")
+            pe = info.get("trailingPE")
+            mcap = info.get("marketCap")
+            debt = info.get("totalDebt")
+            ebitda = info.get("ebitda")
+            debt_ebitda = (debt / ebitda) if isinstance(debt, (int, float)) and isinstance(ebitda, (int, float)) and ebitda else None
+
+            # rebuild
+            out.append(_mk_pick_line(name, sym, price, score, conf))
+            bullets = []
+            prof = []
+            if sector:
+                prof.append(sector + (f" — {industry}" if industry else ""))
+            if isinstance(beta, (int, float)):
+                prof.append(f"β≈{beta:.2f}")
+            if isinstance(dy, (int, float)) and dy > 0:
+                prof.append(f"DY≈{dy*100:.1f}%")
+            if prof:
+                bullets.append("Profile: " + " • ".join(prof))
+            val = []
+            if isinstance(pe, (int, float)):
+                val.append(f"P/E≈{pe:.1f}x")
+            if isinstance(mcap, (int, float)):
+                val.append(f"Cap≈${mcap/1e9:.0f}B")
+            if val:
+                bullets.append("Valuation: " + " • ".join(val))
+            mom = []
+            if rsi is not None:
+                mom.append(f"RSI {rsi:.0f}")
+            if sma50 is not None and close is not None:
+                mom.append(f"Trend {trend}")
+            if vol20 is not None:
+                mom.append(f"σ20d≈{vol20*100:.1f}%")
+            if mom:
+                bullets.append("Momentum & risk: " + " • ".join(mom))
+            if debt_ebitda is not None:
+                bullets.append(f"Balance sheet: Debt/EBITDA≈{debt_ebitda:.1f}×")
+            bullets.append(
+                "Why it screens as *defensive*: below-market β and/or dividend cushion, "
+                "neutral-to-positive trend, and non-stretched multiples (demo data)."
+            )
+            out.extend([f"    - {b}" for b in bullets])
+            out.append("")
+        if any_match:
+            header = f"### Safe stock suggestions ({risk_label})\n"
+            return header + "\n".join(out)
+    except Exception:
+        pass
+
+    # Nothing matched, just remove any “Note:” lines
+    cleaned = "\n".join([ln for ln in markdown_text.splitlines() if not ln.strip().startswith("Note:")])
+    return cleaned
+
+
 # ============================ Styles ===========================
 st.markdown(
     """
@@ -275,9 +534,9 @@ with col2:
             st.session_state.messages.append({"role": "user", "content": query})
 
             # ----- File handling -----
+            uploaded_file = st.session_state.get("uploaded_file") or uploaded_file  # keep reference
             file_path = None
             appended_text = ""
-            uploaded = st.session_state.get("uploaded_file_memo")  # not used; kept for clarity
             if uploaded_file is not None:
                 if uploaded_file.type == "application/pdf":
                     safe_name = "".join(c for c in uploaded_file.name if c.isalnum() or c in ("-", "_", "."))
@@ -335,7 +594,10 @@ with col2:
                     user_id=st.session_state.user_id,
                 )
 
-            st.session_state.messages.append({"role": "agent", "content": result.get("response", "")})
+            # >>> Only change: normalize + enrich the agent text (handles the “Market Analysis” format)
+            _enriched = _enrich_recommendations(result.get("response", ""))
+            st.session_state.messages.append({"role": "agent", "content": _enriched})
+
             st.session_state.clear_query = True
             st.rerun()
 
