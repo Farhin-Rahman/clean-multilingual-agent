@@ -7,16 +7,19 @@ pandas~=2.3
 numpy~=1.26
 yfinance<0.2.50,>=0.2.38
 requests<2.33,>=2.31
-beautifulsoup4~=4.13
+beautifulsoup4~=4.12
 lxml>=5.1,<6
 html5lib~=1.1
 requests-cache~=1.2
+
+# --- Resilience & retries ---
+tenacity~=8.2
 
 # --- Agent orchestration ---
 langgraph<0.3,>=0.2.20
 
 # --- NLP & translation ---
-transformers~=4.41.0   # Kept original or let it float, it will work
+transformers~=4.41.0
 sentencepiece>=0.1.99
 langdetect~=1.0.9
 torch<2.4,>=2.2
@@ -39,7 +42,7 @@ pydantic<2.9,>=2.8
 # --- Audio I/O (optional) ---
 gTTS<2.6,>=2.5
 streamlit-mic-recorder<0.1,>=0.0.8
-faster-whisper~=1.0.0     # <<< THIS IS THE KEY FIX
+faster-whisper~=1.0.0     # <<< KEY FIX
 
 # --- Optional FAISS (skip on Windows, use fallback) ---
 faiss-cpu>=1.8.0; platform_system != "Windows"

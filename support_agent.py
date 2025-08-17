@@ -1,8 +1,7 @@
-# support_agent.py — Free-first Financial Assistant with multi-RAG + rules + provenance
+# support_agent.py
 from __future__ import annotations
 from typing import TypedDict, Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass
-from langgraph.graph import StateGraph, END
 from functools import lru_cache
 from dotenv import load_dotenv
 
@@ -10,18 +9,29 @@ import fitz  # PyMuPDF
 
 import os, re, time, json, math, logging, hashlib, sqlite3
 import requests
-import requests_cache
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
+from tenacity import retry, stop_after_attempt, wait_exponential
 
-# Optional: language detection/translation (kept)
-from langdetect import detect
-from transformers import pipeline
+# NEW: robust retries
 
-# DuckDuckGo search (used by retrievers)
+
+# Optional: language detection/translation
+try:
+    from langdetect import detect
+except Exception:
+    detect = None
+
+try:
+    from transformers import pipeline
+except Exception:
+    pipeline = None  # translation optional
+
+# Search
+# Search
 from duckduckgo_search import DDGS
 
 # Validation & parsing
@@ -29,35 +39,44 @@ from pydantic import BaseModel, Field, ValidationError
 import sqlglot
 from sqlglot.expressions import Select
 
-# Multi-RAG modules (3 tracks)
+# RAG modules (project-local)
 from rag_text import add_from_urls_text, retrieve_text
 from rag_logic import add_from_urls_logic, retrieve_logic, extract_logical as extract_logical_from_hits
 from rag_numeric import ingest_numeric_for_symbols, numeric_retrieve
 
-# Sentiment: FinBERT primary, VADER fallback
+# Sentiment (FinBERT primary, VADER fallback handled in sent backend)
 from sentiment_backend import sent_score as _sent_score
 
 load_dotenv()
 
-# ─────────────────────────── Constants / logging ───────────────────────────
+# --------------------------- Logging & knobs ------------------------------
+LOGLEVEL = (os.getenv("LOGLEVEL") or "INFO").upper()
+logging.basicConfig(level=getattr(logging, LOGLEVEL, logging.INFO))
+logger = logging.getLogger("support_agent")
+
+# Optional HTTP cache (global install)
+try:
+    import requests_cache  # type: ignore
+    requests_cache.install_cache("web_cache", backend="sqlite", expire_after=3600)
+    logger.info("requests-cache enabled.")
+except Exception:
+    logger.warning("requests-cache unavailable; continuing without HTTP cache.")
+    requests_cache = None  # type: ignore
+
+# Demo / hardening env knobs
+AGENT_DISABLE_LLM = (os.getenv("AGENT_DISABLE_LLM", "0") == "1")
+YF_MAX_SYMBOLS = int(os.getenv("YF_MAX_SYMBOLS", "8"))  # keep small to avoid throttling
 PRICE_BUCKET_SECONDS = 600
 SP500_CACHE_FILE = "sp500_cache.csv"
 SP500_CACHE_TTL_HOURS = 24
 SP500_FULL_CACHE_FILE = "sp500_full_cache.csv"
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("support_agent")
-
-# Lightweight HTTP cache for polite web usage
-requests_cache.install_cache("web_cache", backend="sqlite", expire_after=3600)
-
-# ───────────────────────────── Security / utils ────────────────────────────
+# ------------------------------ Security ---------------------------------
 class SecurityManager:
     @staticmethod
     def allowlist_sql(query: str) -> str:
         q = (query or "").strip()
-        # forbid SQL comments
-        if re.search(r"--|/\*|\*/", q):
+        if re.search(r"(--|/\*|\*/)", q):
             raise ValueError("SQL comments are not allowed.")
         q = q.replace(";", "")
         if not re.match(r"^\s*select\b", q, re.IGNORECASE):
@@ -76,6 +95,7 @@ class SecurityManager:
         return hashlib.sha256(data.encode()).hexdigest()[:16]
 
 APPROVED_TABLES = {"companies", "portfolios"}
+
 def validate_sql_ast(query: str) -> str:
     safe_q = SecurityManager.allowlist_sql(query)
     try:
@@ -95,6 +115,7 @@ class RateLimiter:
     def __init__(self):
         self.requests: Dict[str, List[float]] = {}
         self.limits = {"free": {"requests": 100, "window": 3600}}
+
     def is_allowed(self, user_id: str) -> tuple[bool, int]:
         now = time.time()
         user_key = f"{user_id}_free"
@@ -113,6 +134,7 @@ class ConversationMemory:
     def __init__(self, max_history: int = 20):
         self.max_history = max_history
         self.conversations: Dict[str, List[Dict[str, Any]]] = {}
+
     def add_exchange(self, user_id: str, user_msg: str, agent_msg: str, context: dict | None = None):
         if user_id not in self.conversations:
             self.conversations[user_id] = []
@@ -126,37 +148,49 @@ class ConversationMemory:
         self.conversations[user_id].append(ex)
         if len(self.conversations[user_id]) > self.max_history:
             self.conversations[user_id] = self.conversations[user_id][-self.max_history:]
+
     def get_context_summary(self, user_id: str, max_tokens: int = 1000) -> str:
-        if user_id not in self.conversations: return ""
+        if user_id not in self.conversations:
+            return ""
         recent = self.conversations[user_id][-5:]
         parts, total = [], 0
         for ex in reversed(recent):
-            if total + ex["tokens"] > max_tokens: break
+            if total + ex["tokens"] > max_tokens:
+                break
             parts.append(f"User: {ex['user']}\nAssistant: {ex['agent'][:200]}...")
             total += ex["tokens"]
         parts.reverse()
         fin = self.extract_financial_preferences(user_id)
-        if fin: parts.append(f"\nUser Financial Profile: {fin}")
+        if fin:
+            parts.append(f"\nUser Financial Profile: {fin}")
         return "\n---\n".join(parts)
+
     def extract_financial_preferences(self, user_id: str) -> str:
-        if user_id not in self.conversations: return ""
+        if user_id not in self.conversations:
+            return ""
         prefs = {"risk_tolerance": None, "sectors": []}
         all_text = " ".join([ex["user"] + " " + ex["agent"] for ex in self.conversations[user_id]]).lower()
-        if any(w in all_text for w in ["conservative", "safe", "low risk"]): prefs["risk_tolerance"]="Conservative"
-        elif any(w in all_text for w in ["aggressive", "high risk", "growth"]): prefs["risk_tolerance"]="Aggressive"
+        if any(w in all_text for w in ["conservative", "safe", "low risk"]):
+            prefs["risk_tolerance"] = "Conservative"
+        elif any(w in all_text for w in ["aggressive", "high risk", "growth"]):
+            prefs["risk_tolerance"] = "Aggressive"
         sectors = ["technology", "healthcare", "finance", "energy", "consumer"]
         for s in sectors:
-            if s in all_text: prefs["sectors"].append(s)
-        out=[]
-        if prefs["risk_tolerance"]: out.append(f"Risk: {prefs['risk_tolerance']}")
-        if prefs["sectors"]: out.append(f"Interested sectors: {', '.join(prefs['sectors'])}")
+            if s in all_text:
+                prefs["sectors"].append(s)
+        out = []
+        if prefs["risk_tolerance"]:
+            out.append(f"Risk: {prefs['risk_tolerance']}")
+        if prefs["sectors"]:
+            out.append(f"Interested sectors: {', '.join(prefs['sectors'])}")
         return "; ".join(out)
 
 # Globals
 rate_limiter: Optional[RateLimiter] = None
 conversation_memory: Optional[ConversationMemory] = None
 
-# ───────────────────────── LLM router / Ollama client ──────────────────────
+
+
 @dataclass
 class _LLMResponse:
     content: str
@@ -172,7 +206,7 @@ MODEL_CATALOG = {
 def _ollama_invoke(messages: List[Dict[str, str]], model: str, temperature: float = 0.1) -> _LLMResponse:
     try:
         payload = {"model": model, "messages": messages, "stream": False, "options": {"temperature": temperature}}
-        r = requests.post(OLLAMA_URL, data=json.dumps(payload), timeout=60)
+        r = requests.post(OLLAMA_URL, data=json.dumps(payload), timeout=30)
         r.raise_for_status()
         data = r.json()
         txt = (data.get("message", {}) or {}).get("content", "") or data.get("content", "") or ""
@@ -182,6 +216,23 @@ def _ollama_invoke(messages: List[Dict[str, str]], model: str, temperature: floa
         return _LLMResponse("")
 
 def llm_call(task: str, messages: List[Dict[str, str]], max_tries: int = 2) -> _LLMResponse:
+    # Deterministic bypass for demos or if Ollama is down
+    if AGENT_DISABLE_LLM:
+        if task == "sql":
+            stub = (
+                "```sql\n"
+                "SELECT symbol, name, sector, market_cap, pe_ratio, price, risk_level, beta "
+                "FROM companies ORDER BY market_cap DESC LIMIT 20;\n"
+                "```\n"
+                "```sql\n"
+                "SELECT symbol, name, sector, pe_ratio, beta FROM companies "
+                "WHERE pe_ratio > 0 AND pe_ratio < 25 AND beta < 1.3 "
+                "ORDER BY pe_ratio ASC LIMIT 20;\n"
+                "```\n"
+            )
+            return _LLMResponse(stub)
+        return _LLMResponse("—")
+
     models = MODEL_CATALOG.get(task, MODEL_CATALOG["default"])
     last = _LLMResponse("")
     for m in models[:max_tries]:
@@ -194,39 +245,66 @@ def llm_call(task: str, messages: List[Dict[str, str]], max_tries: int = 2) -> _
             if len(txt) > 5:
                 return resp
         last = resp
-    return last
 
-# ─────────────────────── Stock data helpers / caching ──────────────────────
+    if task == "sql":
+        stub = (
+            "```sql\n"
+            "SELECT symbol, name, sector, market_cap, pe_ratio, price, risk_level, beta "
+            "FROM companies ORDER BY market_cap DESC LIMIT 20;\n"
+            "```\n"
+            "```sql\n"
+            "SELECT symbol, name, sector, pe_ratio, beta FROM companies "
+            "WHERE pe_ratio > 0 AND pe_ratio < 25 AND beta < 1.3 "
+            "ORDER BY pe_ratio ASC LIMIT 20;\n"
+            "```\n"
+        )
+        return _LLMResponse(stub)
+    return _LLMResponse("—")
+
+# ==============================================================================
+# =================== ROBUST, CACHED, AND RETRYING DATA LAYER ==================
+# ==============================================================================
+
+_YF_SESSION = None
+
+def get_yf_session():
+    """Create/reuse a session with caching + browser-like User-Agent."""
+    global _YF_SESSION
+    if _YF_SESSION is None:
+        if requests_cache is not None:
+            _YF_SESSION = requests_cache.CachedSession(
+                'web_cache',
+                backend='sqlite',
+                expire_after=3600,
+                use_cache_dir=True,
+            )
+        else:
+            _YF_SESSION = requests.Session()
+        _YF_SESSION.headers.update({
+            'User-Agent': ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                           'AppleWebKit/537.36 (KHTML, like Gecko) '
+                           'Chrome/115.0 Safari/537.36')
+        })
+    return _YF_SESSION
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10), reraise=True)
+def robust_yf_download(tickers, **kwargs):
+    """Robust wrapper around yf.download using our cached session + retries."""
+    return yf.download(tickers, session=get_yf_session(), **kwargs)
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=8), reraise=True)
+def get_robust_ticker(symbol: str) -> yf.Ticker:
+    """Robust wrapper to build a Ticker using our cached session + retries."""
+    return yf.Ticker(symbol, session=get_yf_session())
+
+# ----------------------- Stock data helpers (no .info) --------------------
 @lru_cache(maxsize=512)
 def _get_ticker(symbol: str):
-    return yf.Ticker(symbol)
+    # use robust session under the hood (and keep an LRU on the symbol)
+    return get_robust_ticker(symbol)
 
 def _price_bucket():
     return int(time.time() // PRICE_BUCKET_SECONDS)
-
-@lru_cache(maxsize=4096)
-def _safe_latest_price_cached(symbol: str, bucket: int):
-    try:
-        t = _get_ticker(symbol)
-        fi = getattr(t, "fast_info", {}) or {}
-        p = fi.get("last_price") or fi.get("last_close") or fi.get("last_price_raw")
-        if p: return float(p)
-        for period in ["5d", "1mo"]:
-            h = t.history(period=period)["Close"].dropna()
-            if len(h): return float(h.iloc[-1])
-    except Exception:
-        pass
-    return None
-
-def safe_latest_price(symbol: str) -> Optional[float]:
-    return _safe_latest_price_cached(symbol, _price_bucket())
-
-@lru_cache(maxsize=2048)
-def _close_series(symbol: str) -> pd.Series:
-    try:
-        return _get_ticker(symbol).history(period="6mo")["Close"].dropna()
-    except Exception:
-        return pd.Series(dtype=float)
 
 def calculate_rsi(prices: pd.Series, periods: int = 14) -> float:
     if len(prices) < periods:
@@ -239,81 +317,123 @@ def calculate_rsi(prices: pd.Series, periods: int = 14) -> float:
     val = rsi.iloc[-1]
     return float(val) if pd.notna(val) else 50.0
 
-def safe_info_and_vol(symbol: str) -> tuple[dict, float]:
-    info, vol = {}, 0.0
+def _download_closes(symbols: List[str], period: str = "6mo") -> dict[str, pd.Series]:
+    out: dict[str, pd.Series] = {}
     try:
-        info = _get_ticker(symbol).info or {}
+        data = robust_yf_download(
+            symbols, period=period, interval="1d",
+            auto_adjust=True, progress=False, group_by="ticker", threads=True
+        )
+        if isinstance(symbols, str) or len(symbols) == 1:
+            sym = symbols[0] if isinstance(symbols, list) else symbols
+            if isinstance(data, pd.DataFrame) and "Close" in data:
+                out[sym] = data["Close"].dropna()
+        else:
+            if isinstance(data, pd.DataFrame) and isinstance(data.columns, pd.MultiIndex):
+                if "Close" in data.columns.get_level_values(0):
+                    closes = data["Close"]
+                    for sym in symbols:
+                        if sym in closes:
+                            s = closes[sym].dropna()
+                            if not s.empty:
+                                out[sym] = s
+            else:
+                for sym in symbols:
+                    try:
+                        s = data[sym]["Close"].dropna()
+                        if not s.empty:
+                            out[sym] = s
+                    except Exception:
+                        continue
     except Exception:
-        info = {}
-    close = _close_series(symbol)
-    if len(close) >= 5:
-        vol = float(close.pct_change().std() * np.sqrt(252))
-    return info, vol
+        # Fallback per-symbol (still via robust session)
+        for sym in symbols:
+            try:
+                s = _get_ticker(sym).history(period="6mo")["Close"].dropna()
+                if not s.empty:
+                    out[sym] = s
+            except Exception:
+                continue
+    return out
 
-def safe_sma_rsi(symbol: str, price_now: float) -> tuple[float, float]:
-    close = _close_series(symbol)
-    if close.empty:
-        return float(price_now), 50.0
-    sma20 = float(close.rolling(20).mean().iloc[-1]) if len(close) >= 20 else float(price_now)
-    rsi = float(calculate_rsi(close)) if len(close) >= 14 else 50.0
-    return sma20, rsi
+@lru_cache(maxsize=1)
+def _spy_series(period: str = "6mo") -> pd.Series:
+    try:
+        s = robust_yf_download("SPY", period=period, interval="1d", auto_adjust=True, progress=False)["Close"].dropna()
+        return s
+    except Exception:
+        return pd.Series(dtype=float)
 
-def _headlines_for_symbol(sym: str, max_n=8) -> List[dict]:
+def _compute_beta(sym_close: pd.Series, mkt_close: pd.Series) -> float:
+    try:
+        df = pd.DataFrame({"s": sym_close.pct_change(), "m": mkt_close.pct_change()}).dropna()
+        if len(df) < 30:
+            return 1.0
+        cov = np.cov(df["s"], df["m"])[0, 1]
+        var = np.var(df["m"])
+        if var <= 0:
+            return 1.0
+        return float(cov / var)
+    except Exception:
+        return 1.0
+
+def _headlines_for_symbol(sym: str, max_n: int = 6) -> List[dict]:
+    """Use DuckDuckGo to avoid Yahoo news throttling."""
     items: List[dict] = []
     try:
-        news = getattr(yf.Ticker(sym), "news", None) or []
-        for n in news:
-            t = n.get("title") or ""
-            u = n.get("link") or n.get("url") or ""
-            p = (n.get("publisher") or "").strip()
-            dt = n.get("providerPublishTime")
-            if isinstance(dt, (int, float)):
-                try: date = datetime.utcfromtimestamp(int(dt)).strftime("%Y-%m-%d")
-                except Exception: date = ""
-            else:
-                date = ""
-            if t and u:
-                items.append({"title": t, "url": u, "publisher": p, "date": date})
+        with DDGS() as ddgs:
+            q = f'{sym} stock news site:reuters.com OR site:barrons.com OR site:bloomberg.com OR site:investors.com OR site:cnbc.com'
+            for r in ddgs.text(q, max_results=max_n):
+                t = (r.get("title") or "").strip()
+                u = (r.get("href") or "").strip()
+                if t and u and u.startswith("http"):
+                    items.append({"title": t, "url": u, "publisher": "", "date": ""})
     except Exception:
         pass
     return items[:max_n]
 
 def get_real_stock_data_parallel(symbols: List[str]) -> List[Dict[str, Any]]:
-    def _fetch(sym: str) -> Dict[str, Any] | None:
+    """Throttle-safe, no .info/news usage. Uses batched price history + DDG headlines."""
+    syms = list(dict.fromkeys([s for s in symbols if s]))[:max(1, YF_MAX_SYMBOLS)]
+    out: List[Dict[str, Any]] = []
+    if not syms:
+        return out
+
+    closes_map = _download_closes(syms, period="6mo")
+    spy = _spy_series(period="6mo")
+
+    for sym in syms:
         try:
-            price_now = safe_latest_price(sym)
-            if price_now is None:
-                return None
-            info, vol = safe_info_and_vol(sym)
-            market_cap = info.get("marketCap", 0)
-            pe_ratio = info.get("trailingPE", 0)
-            sector = info.get("sector", "Unknown")
-            name = info.get("longName", sym)
-            beta = (info.get("beta") or 1.0)
-            if (beta and beta < 0.8) and (vol and vol < 0.25): risk = "Low"
-            elif (beta and beta > 1.2) or (vol and vol > 0.40): risk = "High"
-            else: risk = "Medium"
-            sma20, rsi = safe_sma_rsi(sym, price_now)
+            close = closes_map.get(sym, pd.Series(dtype=float))
+            if close.empty:
+                continue
+            price_now = float(close.iloc[-1])
+            vol = float(close.pct_change().std() * np.sqrt(252)) if len(close) >= 30 else 0.0
+            sma20 = float(close.rolling(20).mean().iloc[-1]) if len(close) >= 20 else price_now
+            rsi = float(calculate_rsi(close)) if len(close) >= 14 else 50.0
+            beta = _compute_beta(close, spy) if not spy.empty else 1.0
+            risk = "Low" if (beta < 0.9 and vol < 0.25) else ("High" if (beta > 1.2 or vol > 0.40) else "Medium")
             headlines = _headlines_for_symbol(sym)
             sent = _sent_score([h["title"] for h in headlines])
-            return {
-                "name": name, "symbol": sym, "sector": sector,
-                "market_cap": market_cap, "pe_ratio": round(pe_ratio, 2) if pe_ratio else 0,
-                "price": round(price_now, 2), "risk": risk, "beta": round(beta, 2) if beta else 1.0,
-                "volatility": round(vol, 3) if vol else 0, "sma_20": round(sma20, 2),
-                "rsi": round(rsi, 1), "trend": "Bullish" if price_now > sma20 else "Bearish",
-                "sentiment": round(sent, 3), "provenance": [{"type":"news", **h} for h in headlines],
-            }
+            out.append({
+                "name": sym,
+                "symbol": sym,
+                "sector": "Unknown",
+                "market_cap": 0.0,
+                "pe_ratio": 0.0,
+                "price": round(price_now, 2),
+                "risk": risk,
+                "beta": round(beta, 2),
+                "volatility": round(vol, 3),
+                "sma_20": round(sma20, 2),
+                "rsi": round(rsi, 1),
+                "trend": "Bullish" if price_now > sma20 else "Bearish",
+                "sentiment": round(sent, 3),
+                "provenance": [{"type": "news", **h} for h in headlines],
+            })
         except Exception:
-            return None
+            continue
 
-    out: List[Dict[str, Any]] = []
-    workers = min(8, max(1, len(symbols)))
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = {ex.submit(_fetch, s): s for s in symbols[:30]}
-        for f in as_completed(futs):
-            rec = f.result()
-            if rec: out.append(rec)
     return out
 
 def normalize_company_keys(c: dict) -> dict:
@@ -334,7 +454,7 @@ def normalize_company_keys(c: dict) -> dict:
         "provenance": c.get("provenance") or [],
     }
 
-# Sector prefilter
+# --------------------------- Sector prefilter -----------------------------
 def get_sp500_tickers() -> List[str]:
     try:
         if os.path.exists(SP500_CACHE_FILE):
@@ -347,12 +467,12 @@ def get_sp500_tickers() -> List[str]:
         return tickers
     except Exception as e:
         logger.warning(f"Failed to get S&P 500 list live: {e}")
-        if os.path.exists(SP500_CACHE_FILE):
-            try:
-                return pd.read_csv(SP500_CACHE_FILE)["Symbol"].tolist()
-            except Exception:
-                pass
-        return ["AAPL","MSFT","GOOGL","AMZN","TSLA","META","NVDA","JPM","JNJ","V"]
+    if os.path.exists(SP500_CACHE_FILE):
+        try:
+            return pd.read_csv(SP500_CACHE_FILE)["Symbol"].tolist()
+        except Exception:
+            pass
+    return ["AAPL","MSFT","GOOGL","AMZN","TSLA","META","NVDA","JPM","JNJ","V"]
 
 def get_sp500_table_cached() -> pd.DataFrame:
     try:
@@ -369,15 +489,15 @@ def get_sp500_table_cached() -> pd.DataFrame:
         return df
     except Exception as e:
         logger.warning(f"Failed to fetch full S&P500 table live: {e}")
-        if os.path.exists(SP500_FULL_CACHE_FILE):
-            try:
-                return pd.read_csv(SP500_FULL_CACHE_FILE)
-            except Exception:
-                pass
-        tickers = get_sp500_tickers()
-        return pd.DataFrame({"Symbol": tickers, "Sector": ["Unknown"] * len(tickers)})
+    if os.path.exists(SP500_FULL_CACHE_FILE):
+        try:
+            return pd.read_csv(SP500_FULL_CACHE_FILE)
+        except Exception:
+            pass
+    tickers = get_sp500_tickers()
+    return pd.DataFrame({"Symbol": tickers, "Sector": ["Unknown"] * len(tickers)})
 
-def prefilter_symbols_by_query(query_lower: str, spx_df: pd.DataFrame, max_candidates: int = 80) -> List[str]:
+def prefilter_symbols_by_query(query_lower: str, spx_df: pd.DataFrame, max_candidates: int = 30) -> List[str]:
     sector_aliases = {
         "Information Technology": ["tech", "technology", "software", "semis", "semiconductor", "it"],
         "Health Care": ["health", "healthcare", "medical", "pharma", "biotech"],
@@ -393,25 +513,23 @@ def prefilter_symbols_by_query(query_lower: str, spx_df: pd.DataFrame, max_candi
     }
     wanted = {sector for sector, keys in sector_aliases.items() if any(k in query_lower for k in keys)}
     df = spx_df[spx_df["Sector"].isin(sorted(wanted))] if wanted else spx_df
-
     return df["Symbol"].tolist()[:max_candidates]
 
 def get_real_stock_data(symbols: List[str]) -> List[Dict[str, Any]]:
-    # kept for compatibility; now calls parallel version
     return get_real_stock_data_parallel(symbols)
 
 def get_stocks_by_real_criteria(query: str) -> List[Dict[str, Any]]:
     query_lower = query.lower()
     spx_df = get_sp500_table_cached()
-    candidates = prefilter_symbols_by_query(query_lower, spx_df, max_candidates=80) or get_sp500_tickers()[:80]
-    real_companies = get_real_stock_data_parallel(candidates[:30])
-    # minimal query filters with fail-safe not to over-filter
+    candidates = prefilter_symbols_by_query(query_lower, spx_df, max_candidates=30) or get_sp500_tickers()[:30]
+    real_companies = get_real_stock_data_parallel(candidates[:YF_MAX_SYMBOLS])
+    # minimal filters
     filtered = real_companies
     tmp = filtered
     if any(w in query_lower for w in ["tech", "technology", "software"]):
         t = [c for c in tmp if "technology" in c.get("sector", "").lower()]
         if t: tmp = t
-    if any(w in query_lower for w in ["safe", "conservative", "stable"]):
+    if any(w in query_lower for w in ["safe", "conservative", "stable", "low risk", "low-risk"]):
         t = [c for c in tmp if (c.get("beta",1.0) < 1.0 and 0 < (c.get("pe_ratio") or 0) < 25 and (c.get("market_cap") or 0) > 1e10)]
         if t: tmp = t
     if "under 50" in query_lower or "under $50" in query_lower:
@@ -420,7 +538,7 @@ def get_stocks_by_real_criteria(query: str) -> List[Dict[str, Any]]:
     filtered = tmp
     return filtered[:10] or real_companies[:10]
 
-# ───────────────────────── Rules / constraints ─────────────────────────────
+# ----------------------------- Rules & MCDM -------------------------------
 def check_constraints(company: dict, user_profile: dict) -> dict:
     flags = []
     risk_tol = (user_profile.get("risk_tolerance") or "").lower()
@@ -439,6 +557,7 @@ RULES = [
     {"id":"flag_litigation_terms","desc":"Flag if litigation/regulatory terms appear","when": lambda c,p: any(k in (c.get("logical_facts") or {}) for k in ["litigation","regulatory"]),"action":"flag"},
     {"id":"boost_profitable","desc":"Boost if profitable (eps>0 & PE>0)","when": lambda c,p: (c.get("eps") or 0) > 0 and (c.get("pe_ratio") or 0) > 0,"action":"boost:0.03"},
 ]
+
 def apply_rules(company: dict, profile: dict) -> dict:
     flags = []; blocked=False; boost=0.0
     for r in RULES:
@@ -453,7 +572,6 @@ def apply_rules(company: dict, profile: dict) -> dict:
             continue
     return {"blocked":blocked, "flags":flags, "boost":boost}
 
-# ─────────────────────── Numeric verification & MCDM ───────────────────────
 def numeric_verification(c: dict) -> dict:
     try:
         price = float(c.get("price") or 0)
@@ -516,15 +634,16 @@ def mcdm_score(c: dict, w: Dict[str, float]) -> Tuple[float, Dict[str, float]]:
 
     feats = {"valuation": round(valuation,3), "risk": round(risk,3), "momentum": round(momentum,3),
              "size": round(size,3), "sentiment": round(sentiment,3)}
-    score = 0.0
-    for k, v in feats.items():
-        score += v * float(w.get(k, 0.0))
+    score = sum(feats[k] * float(w.get(k, 0.0)) for k in feats)
     return float(max(0.0, min(1.0, score))), feats
 
-# ───────────────────────────── Translation utils ───────────────────────────
+# -------------------------- Translation utils ----------------------------
 SUPPORTED_LANGUAGES = {"bn":"Bengali","es":"Spanish","de":"German","fr":"French","it":"Italian","pt":"Portuguese","en":"English"}
+
 @lru_cache(maxsize=20)
 def get_translator(source_lang: str, target_lang: str):
+    if pipeline is None:
+        return None
     model_name = f"Helsinki-NLP/opus-mt-{source_lang}-{target_lang}"
     try:
         return pipeline("translation", model=model_name, max_length=512)
@@ -533,6 +652,8 @@ def get_translator(source_lang: str, target_lang: str):
         return None
 
 def translate_input_to_english(text: str) -> tuple[str, str]:
+    if detect is None:
+        return text, "en"
     try:
         detected_lang = detect(text)
         if detected_lang == "en":
@@ -548,7 +669,8 @@ def translate_input_to_english(text: str) -> tuple[str, str]:
         return text, "en"
 
 def translate_output_from_english(text: str, target_lang: str) -> str:
-    if target_lang == "en": return text
+    if target_lang == "en":
+        return text
     try:
         translator = get_translator("en", target_lang)
         if translator:
@@ -558,7 +680,7 @@ def translate_output_from_english(text: str, target_lang: str) -> str:
         logger.warning(f"Output translation failed: {e}")
     return text
 
-# ───────────────────────── PDF / Web search helpers ────────────────────────
+# --------------------------- PDF / Web helpers ---------------------------
 def extract_text_from_pdf(file_path: str) -> str:
     try:
         doc = fitz.open(file_path)
@@ -577,59 +699,62 @@ def web_search_ddg(query: str, max_results: int = 3) -> str:
             return "No web search results found."
         out = "Recent web search results:\n\n"
         for i, r in enumerate(results, 1):
-            out += f"{i}. **{r['title']}**\n"
-            out += f"   {r['body'][:200]}...\n"
-            out += f"   Source: {r['href']}\n\n"
+            out += f"{i}. {r.get('title','')}\n"
+            out += f"   {(r.get('body','')[:200])}...\n"
+            out += f"   Source: {r.get('href','')}\n\n"
         return out
     except Exception as e:
         logger.warning(f"Web search failed: {e}")
         return "Web search temporarily unavailable."
 
-# ───────────────────────────── DB: Portfolios ──────────────────────────────
+# ----------------------------- DB: Portfolios ----------------------------
 class SecurePortfolioManager:
     def __init__(self):
         self.db_path = "secure_portfolios.db"
         self.init_database()
+
     def get_db_connection(self):
         conn = sqlite3.connect(self.db_path)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         return conn
+
     def init_database(self):
         try:
             with self.get_db_connection() as conn:
                 conn.execute("""
-                    CREATE TABLE IF NOT EXISTS portfolios (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        user_id TEXT NOT NULL,
-                        symbol TEXT NOT NULL,
-                        shares REAL NOT NULL CHECK (shares > 0),
-                        purchase_price REAL NOT NULL CHECK (purchase_price > 0),
-                        purchase_date TEXT NOT NULL,
-                        risk_tolerance TEXT CHECK (risk_tolerance IN ('Low','Medium','High')),
-                        investment_goals TEXT,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    )
-                """)
+CREATE TABLE IF NOT EXISTS portfolios (
+id INTEGER PRIMARY KEY AUTOINCREMENT,
+user_id TEXT NOT NULL,
+symbol TEXT NOT NULL,
+shares REAL NOT NULL CHECK (shares > 0),
+purchase_price REAL NOT NULL CHECK (purchase_price > 0),
+purchase_date TEXT NOT NULL,
+risk_tolerance TEXT CHECK (risk_tolerance IN ('Low','Medium','High')),
+investment_goals TEXT,
+created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)
+""")
                 conn.execute("""
-                    CREATE TABLE IF NOT EXISTS user_profiles (
-                        user_id TEXT PRIMARY KEY,
-                        age INTEGER CHECK (age >= 18 AND age <= 100),
-                        risk_tolerance TEXT CHECK (risk_tolerance IN ('Conservative','Moderate','Aggressive')),
-                        investment_timeline TEXT,
-                        income_level TEXT,
-                        experience_level TEXT,
-                        financial_goals TEXT,
-                        created_date TEXT,
-                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    )
-                """)
+CREATE TABLE IF NOT EXISTS user_profiles (
+user_id TEXT PRIMARY KEY,
+age INTEGER CHECK (age >= 18 AND age <= 100),
+risk_tolerance TEXT CHECK (risk_tolerance IN ('Conservative','Moderate','Aggressive')),
+investment_timeline TEXT,
+income_level TEXT,
+experience_level TEXT,
+financial_goals TEXT,
+created_date TEXT,
+updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)
+""")
                 conn.execute("CREATE TABLE IF NOT EXISTS companies (symbol TEXT PRIMARY KEY, name TEXT, sector TEXT, market_cap REAL, pe_ratio REAL, price REAL, risk_level TEXT, beta REAL)")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_portfolios_user_id ON portfolios(user_id)")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_portfolios_symbol ON portfolios(symbol)")
                 conn.commit()
         except Exception as e:
             logger.error(f"Database initialization failed: {e}")
+
     def add_to_portfolio(self, user_id: str, symbol: str, shares: float, price: float) -> bool:
         try:
             user_id = SecurityManager.validate_user_id(user_id)
@@ -638,54 +763,59 @@ class SecurePortfolioManager:
                 raise ValueError("Shares and price must be positive")
             with self.get_db_connection() as conn:
                 conn.execute("""
-                    INSERT INTO portfolios
-                    (user_id, symbol, shares, purchase_price, purchase_date, risk_tolerance, investment_goals)
-                    VALUES (?, ?, ?, ?, date('now'), ?, ?)
-                """, (user_id, symbol, shares, price, "Medium", "Growth"))
+INSERT INTO portfolios
+(user_id, symbol, shares, purchase_price, purchase_date, risk_tolerance, investment_goals)
+VALUES (?, ?, ?, ?, date('now'), ?, ?)
+""", (user_id, symbol, shares, price, "Medium", "Growth"))
                 conn.commit()
-                return True
+            return True
         except Exception as e:
             logger.error(f"Portfolio add failed: {e}")
             return False
+
     def get_portfolio_performance(self, user_id: str) -> dict:
         try:
             user_id = SecurityManager.validate_user_id(user_id)
             with self.get_db_connection() as conn:
                 positions = conn.execute("""
-                    SELECT symbol, shares, purchase_price FROM portfolios WHERE user_id = ? ORDER BY created_at DESC
-                """, (user_id,)).fetchall()
-            total_value=0.0; total_cost=0.0; performance=[]
-            for symbol, shares, purchase_price in positions:
-                try:
-                    current_price = safe_latest_price(symbol)
-                    if current_price is None: continue
-                    position_value = shares * current_price
-                    position_cost = shares * purchase_price
-                    pnl = position_value - position_cost
-                    pnl_pct = (pnl / position_cost) * 100 if position_cost > 0 else 0
-                    performance.append({
-                        "symbol": symbol, "shares": shares, "current_price": round(current_price,2),
-                        "purchase_price": purchase_price, "current_value": round(position_value,2),
-                        "pnl": round(pnl,2), "pnl_pct": round(pnl_pct,2)
-                    })
-                    total_value += position_value; total_cost += position_cost
-                except Exception as e:
-                    logger.warning(f"Failed to get price for {symbol}: {e}")
-                    continue
-            return {
-                "positions": performance, "total_value": round(total_value,2), "total_cost": round(total_cost,2),
-                "total_pnl": round(total_value - total_cost,2),
-                "total_return_pct": round(((total_value - total_cost)/total_cost*100),2) if total_cost>0 else 0
-            }
+SELECT symbol, shares, purchase_price FROM portfolios WHERE user_id = ? ORDER BY created_at DESC
+""", (user_id,)).fetchall()
+                total_value=0.0; total_cost=0.0; performance=[]
+                for symbol, shares, purchase_price in positions:
+                    try:
+                        ticker = _get_ticker(symbol)
+                        close = ticker.history(period="5d")["Close"].dropna()
+                        current_price = float(close.iloc[-1]) if len(close) else None
+                        if current_price is None: 
+                            continue
+                        position_value = shares * current_price
+                        position_cost = shares * purchase_price
+                        pnl = position_value - position_cost
+                        pnl_pct = (pnl / position_cost) * 100 if position_cost > 0 else 0
+                        performance.append({
+                            "symbol": symbol, "shares": shares, "current_price": round(current_price,2),
+                            "purchase_price": purchase_price, "current_value": round(position_value,2),
+                            "pnl": round(pnl,2), "pnl_pct": round(pnl_pct,2)
+                        })
+                        total_value += position_value; total_cost += position_cost
+                    except Exception as e:
+                        logger.warning(f"Failed to get price for {symbol}: {e}")
+                        continue
+                return {
+                    "positions": performance, "total_value": round(total_value,2), "total_cost": round(total_cost,2),
+                    "total_pnl": round(total_value - total_cost,2),
+                    "total_return_pct": round(((total_value - total_cost)/total_cost*100),2) if total_cost>0 else 0
+                }
         except Exception as e:
             logger.error(f"Portfolio performance calculation failed: {e}")
             return {"positions": [], "total_value": 0, "total_cost": 0, "total_pnl": 0, "total_return_pct": 0}
 
-# ───────────────────────────── Agent state ─────────────────────────────────
+# ----------------------------- Agent state -------------------------------
 class FinancialAgentState(TypedDict):
     query: str
     user_profile: Dict
     user_requirements: Dict
+    decomposed: Dict
     sql_queries: List[str]
     company_data: List[Dict]
     market_analysis: str
@@ -694,7 +824,55 @@ class FinancialAgentState(TypedDict):
     recommendations: List[Dict]
     final_response: str
 
-# ───────────────────────────── LLM agents ──────────────────────────────────
+# --------------------------- Query Decomposition -------------------------
+def query_decomposition_agent(state: FinancialAgentState):
+    q = state["query"]
+    # Try LLM if allowed
+    if not AGENT_DISABLE_LLM:
+        prompt = (
+            "Analyze the user's intent for stock selection. "
+            "Return STRICT JSON with keys: risk_profile (conservative|moderate|aggressive), "
+            "sectors (list of strings), keywords (list of strings). "
+            f'User query: "{q}"'
+        )
+        try:
+            resp = llm_call("analysis", [{"role": "user", "content": prompt}], max_tries=1).content.strip()
+            m = re.search(r"\{.*\}", resp, re.S)
+            if m:
+                parsed = json.loads(m.group(0))
+                state["decomposed"] = {
+                    "risk_profile": str(parsed.get("risk_profile","moderate")).lower(),
+                    "sectors": [str(s) for s in parsed.get("sectors", [])],
+                    "keywords": [str(s) for s in parsed.get("keywords", [])],
+                }
+                return state
+        except Exception:
+            pass
+
+    # Heuristic fallback
+    ql = q.lower()
+    risk = "conservative" if any(w in ql for w in ["safe","low risk","conservative","stable"]) else (
+           "aggressive" if any(w in ql for w in ["aggressive","high risk","growth"]) else "moderate")
+    sectors = []
+    for s, ks in {
+        "technology": ["tech","technology","software","semis","semiconductor","it"],
+        "healthcare": ["health","healthcare","medical","pharma","biotech"],
+        "finance": ["bank","finance","financial","insurance"],
+        "energy": ["energy","oil","gas"],
+        "consumer": ["consumer","retail","ecommerce","auto","staples"],
+        "industrials": ["industrial","manufacturing","aerospace","defense"],
+        "utilities": ["utility","utilities","power","electric"],
+        "materials": ["materials","mining","chemicals"],
+        "real estate": ["reit","real estate","property"],
+        "communication": ["telecom","media","social","communication"],
+    }.items():
+        if any(k in ql for k in ks):
+            sectors.append(s)
+    keywords = re.findall(r"[a-zA-Z\-]{3,}", ql)
+    state["decomposed"] = {"risk_profile": risk, "sectors": sectors, "keywords": keywords[:10]}
+    return state
+
+# ------------------------------ LLM agents --------------------------------
 def generate_sql_agent(state: FinancialAgentState):
     query = state["query"]
     user_profile = state.get("user_profile", {})
@@ -702,18 +880,19 @@ def generate_sql_agent(state: FinancialAgentState):
 Generate 2-3 read-only SQL queries for financial analysis (SQLite syntax).
 
 Context:
-- Query: "{query}"
-- User Profile: Risk: {user_profile.get('risk_tolerance','Moderate')}, Timeline: {user_profile.get('investment_timeline','Medium-term')}
 
+Query: "{query}"
+User Profile: Risk: {user_profile.get('risk_tolerance','Moderate')}, Timeline: {user_profile.get('investment_timeline','Medium-term')}
 Schema:
-- companies(symbol, name, sector, market_cap, pe_ratio, price, risk_level, beta)
-- portfolios(user_id, symbol, shares, purchase_price, purchase_date)
 
+companies(symbol, name, sector, market_cap, pe_ratio, price, risk_level, beta)
+portfolios(user_id, symbol, shares, purchase_price, purchase_date)
 Constraints:
-- SINGLE SELECT only
-- No JOINs outside listed tables
-- No comments
-Return queries fenced in ```sql blocks.
+
+SINGLE SELECT only
+No JOINs outside listed tables
+No comments
+Return queries fenced in sql blocks.
 """.strip()
     try:
         resp = llm_call("sql", [{"role":"user","content":sql_prompt}], max_tries=2)
@@ -749,19 +928,19 @@ def data_integration_agent(state: FinancialAgentState):
         logger.warning("SQL yielded no results, falling back to live screening.")
         company_data = [normalize_company_keys(x) for x in get_stocks_by_real_criteria(query)]
 
-    # enrich with live metrics (parallel)
+    # enrich with live metrics (already batched inside)
     syms = [c["symbol"] for c in company_data][:10]
     live = {c["symbol"]: c for c in get_real_stock_data_parallel(syms)}
     company_data = [{**c, **(live.get(c["symbol"], {}))} for c in company_data]
 
-    # Market narrative using analysis model
+    # Market narrative (best-effort)
     analysis_prompt = f"""
 Provide a concise (2-3 sentences) market snapshot for these companies:
 {[{'name': c['name'], 'sector': c['sector'], 'pe': c.get('pe_ratio','N/A'), 'mcap': c.get('market_cap',0)} for c in company_data[:3]]}
 Discuss sector trends and risk.
 """
     try:
-        analysis_response = llm_call("analysis", [{"role":"user","content":analysis_prompt}], max_tries=2)
+        analysis_response = llm_call("analysis", [{"role":"user","content":analysis_prompt}], max_tries=1)
         state["market_analysis"] = analysis_response.content.strip() or "—"
     except Exception as e:
         logger.error(f"Market analysis failed: {e}")
@@ -770,37 +949,53 @@ Discuss sector trends and risk.
     state["company_data"] = company_data[:6]
     return state
 
-# ───────────────────────────── 3 RAG agents ────────────────────────────────
+# ------------------------------- RAG agents -------------------------------
 def qualitative_retriever_agent(state: FinancialAgentState):
     syms = [c["symbol"] for c in state.get("company_data", [])][:5]
     urls = set()
+    decomp = state.get("decomposed", {})
+    kw = " ".join(decomp.get("keywords", [])[:5]) if decomp else ""
+    logger.info(f"QUAL RAG: Starting search for symbols: {syms}")
+
     for s in syms:
         try:
             with DDGS() as ddgs:
-                for r in ddgs.text(f"{s} company analysis news review", max_results=5):
+                for r in ddgs.text(f"{s} investment thesis analysis {kw}", max_results=5):
                     if (r.get("href") or "").startswith("http"):
                         urls.add(r["href"])
-        except Exception:
+        except Exception as e:
+            logger.warning(f"QUAL RAG DDG failed for {s}: {e}")
             continue
-    try: add_from_urls_text(list(urls)[:12])
-    except Exception: pass
+    logger.info(f"QUAL RAG: Found {len(urls)} unique URLs to process.")
+
+    added_count = 0
+    try:
+        added_count = add_from_urls_text(list(urls)[:12])
+        logger.info(f"QUAL RAG: Successfully added documents from {added_count} URLs.")
+    except Exception as e:
+        logger.error(f"QUAL RAG: Failed to add URLs. Error: {e}")
 
     enriched = []
     for c in state.get("company_data", []):
+        prov = list(c.get("provenance", []))
         try:
             hits = retrieve_text(f"{c.get('name') or c['symbol']} investment thesis news", k=3)
-            prov = c.get("provenance", [])
+            if not hits:
+                # negative provenance marker for debugging/visibility
+                prov.append({"type": "qual", "title": "No qualitative documents found", "url": "", "date": ""})
             for h in hits[:2]:
                 prov.append({"type":"qual","title":h["title"],"url":h["url"],"date":""})
             enriched.append({**c, "provenance": prov})
-        except Exception:
-            enriched.append(c)
+        except Exception as e:
+            logger.warning(f"QUAL RAG retrieve failed for {c.get('symbol')}: {e}")
+            enriched.append({**c, "provenance": prov})
     state["company_data"] = enriched
     return state
 
 def logical_retriever_agent(state: FinancialAgentState):
     syms = [c["symbol"] for c in state.get("company_data", [])][:5]
     urls = set()
+    logger.info(f"LOGIC RAG: Starting search for symbols: {syms}")
     for s in syms:
         for q in [f"{s} press release acquisition OR merger OR financing",
                   f"{s} site:sec.gov 8-K OR 10-K OR 10-Q"]:
@@ -809,49 +1004,61 @@ def logical_retriever_agent(state: FinancialAgentState):
                     for r in ddgs.text(q, max_results=5):
                         if (r.get("href") or "").startswith("http"):
                             urls.add(r["href"])
-            except Exception:
+            except Exception as e:
+                logger.warning(f"LOGIC RAG DDG failed for {s}: {e}")
                 continue
-    try: add_from_urls_logic(list(urls)[:15])
-    except Exception: pass
+    logger.info(f"LOGIC RAG: Found {len(urls)} unique URLs to process.")
+    try:
+        add_from_urls_logic(list(urls)[:15])
+    except Exception as e:
+        logger.error(f"LOGIC RAG add failed: {e}")
 
     enriched=[]
     for c in state.get("company_data", []):
+        prov = list(c.get("provenance", []))
         try:
             name = c.get("name") or c["symbol"]
             hits = retrieve_logic(f"{name} merger acquisition financing litigation regulatory", k=5)
             snippets = [h["snippet"] for h in hits]
             logical = extract_logical_from_hits(snippets)
-            prov = c.get("provenance", [])
+            if not hits:
+                prov.append({"type":"logic","title":"No regulatory/logical docs found","url":"","date":""})
             for h in hits[:2]:
                 prov.append({"type":"logic","title":h["title"],"url":h["url"],"date":""})
             enriched.append({**c, "logical_facts": logical, "provenance": prov})
-        except Exception:
-            enriched.append(c)
+        except Exception as e:
+            logger.warning(f"LOGIC RAG retrieve failed for {c.get('symbol')}: {e}")
+            enriched.append({**c, "provenance": prov})
     state["company_data"] = enriched
     return state
 
 def numeric_retriever_agent(state: FinancialAgentState):
     syms = [c["symbol"] for c in state.get("company_data", [])][:5]
-    try: ingest_numeric_for_symbols(syms)
-    except Exception: pass
+    try:
+        ingest_numeric_for_symbols(syms)
+    except Exception as e:
+        logger.warning(f"NUM RAG ingest failed: {e}")
 
     enriched = []
     for c in state.get("company_data", []):
+        prov2 = list(c.get("provenance", []))
         try:
             num_hits = numeric_retrieve("revenue eps free cash flow debt", [c["symbol"]], topk=5)
-            prov2 = list(c.get("provenance", []))
+            if not num_hits:
+                prov2.append({"type":"numeric","title":"No numeric facts found","url":"","date":""})
             numeric_facts=[]
             for nh in num_hits:
                 numeric_facts.append({"metric": nh["metric"], "period": nh["period"], "value": nh["value"]})
                 prov2.append({"type":"numeric","title": nh.get("title",""), "url": nh.get("url",""), "date": nh.get("period","")})
             eps_guess = next((f["value"] for f in numeric_facts if "eps" in f["metric"]), None)
             enriched.append({**c, "numeric_facts": numeric_facts, "eps": c.get("eps") or eps_guess, "provenance": prov2})
-        except Exception:
-            enriched.append(c)
+        except Exception as e:
+            logger.warning(f"NUM RAG retrieve failed for {c.get('symbol')}: {e}")
+            enriched.append({**c, "provenance": prov2})
     state["company_data"] = enriched
     return state
 
-# ─────────────────────────── Verifier / Recommender ────────────────────────
+# -------------------------- Verifier / Recommender -----------------------
 def verifier_agent(state: FinancialAgentState):
     enriched=[]
     for c in state.get("company_data", []):
@@ -860,7 +1067,7 @@ def verifier_agent(state: FinancialAgentState):
         news_n = sum(1 for p in prov if p.get("type")=="news")
         qual_n = sum(1 for p in prov if p.get("type")=="qual")
         logic_n= sum(1 for p in prov if p.get("type")=="logic")
-        num_n  = sum(1 for p in prov if p.get("type")=="numeric")
+        num_n = sum(1 for p in prov if p.get("type")=="numeric")
         conf = (
             0.25*(1.0 if vr["numeric_ok"] else 0.3)
             + 0.25*min(1.0, news_n/4.0)
@@ -908,16 +1115,15 @@ def recommendation_agent(state: FinancialAgentState):
     ranked=[]; excluded=[]
     for c in companies[:8]:
         prov = c.get("provenance", [])
-        if not prov:
-            excluded.append({"symbol": c.get("symbol"), "reason": "no_evidence"}); continue
-
+        # With negative-provenance markers, prov won't be empty, so we don't auto-exclude.
         gate = check_constraints(c, profile)
         rules = apply_rules(c, profile)
         if rules["blocked"]:
-            excluded.append({"symbol": c.get("symbol"), "reason": "policy_block", "flags": rules["flags"]}); continue
+            excluded.append({"symbol": c.get("symbol"), "reason": "policy_block", "flags": rules["flags"]}); 
+            continue
 
         score, feats = mcdm_score(c, weights)
-        score = max(0.0, min(1.0, score + rules["boost"] - (0.15 if not gate["allowed"] else 0.0)))
+        score = max(0.0, min(1.0, score + rules["boost"] - (0.10 if not gate["allowed"] else 0.0)))
 
         news = [p for p in prov if p.get("type")=="news"][:2]
         qual = [p for p in prov if p.get("type")=="qual"][:1]
@@ -935,7 +1141,7 @@ def recommendation_agent(state: FinancialAgentState):
             "price": c["price"], "pe_ratio": c.get("pe_ratio"), "market_cap": c.get("market_cap"),
             "risk": c.get("risk"), "score": score, "features": feats, "confidence": c.get("confidence",0.0),
             "flags": list(set((gate["flags"] or []) + rules["flags"])), "rationale": rationale,
-            "sources": [{"title":s.get("title",""),"url":s.get("url",""),"date":s.get("date","")} for s in sources if s.get("url")],
+            "sources": [{"title":s.get("title",""),"url":s.get("url",""),"date":s.get("date","")} for s in sources if s.get("url","") or s.get("title","")],
         })
 
     ranked = validate_recommendations(ranked)
@@ -966,7 +1172,7 @@ def recommendation_agent(state: FinancialAgentState):
         "**Top Picks (weighted + confidence + constraints + sources):**",
     ]
     for r in top:
-        src_str = " ; ".join(f"[{i+1}]({s['url']}) {s.get('date','')}" for i,s in enumerate(r["sources"]))
+        src_str = " ; ".join(f"[{i+1}]({s['url']}) {s.get('date','')}" if s.get('url') else f"{s.get('title','')}" for i,s in enumerate(r["sources"]))
         flag_str = f" | Flags: {', '.join(r['flags'])}" if r["flags"] else ""
         lines.append(
             f"- **{r['company']}** ({r['symbol']}) — score {r['score']:.3f} | "
@@ -981,8 +1187,7 @@ def recommendation_agent(state: FinancialAgentState):
         why=[]
         for ex in excluded[:3]:
             reason = ex.get("reason")
-            if reason == "no_evidence": why.append(f"{ex['symbol']}: no evidence")
-            elif reason == "policy_block": why.append(f"{ex['symbol']}: blocked by policy ({', '.join(ex.get('flags', []))})")
+            if reason == "policy_block": why.append(f"{ex['symbol']}: blocked by policy ({', '.join(ex.get('flags', []))})")
         if why:
             lines.append("\n**Not recommended (reasons):** " + " | ".join(why))
 
@@ -990,9 +1195,12 @@ def recommendation_agent(state: FinancialAgentState):
     state["final_response"] = "\n".join(lines)
     return state
 
-# ───────────────────────────── Workflow graph ──────────────────────────────
+# ----------------------------- Workflow graph ----------------------------
+from langgraph.graph import StateGraph, END
+
 def create_financial_workflow():
     workflow = StateGraph(FinancialAgentState)
+    workflow.add_node("decompose", query_decomposition_agent)
     workflow.add_node("sql_agent", generate_sql_agent)
     workflow.add_node("data_agent", data_integration_agent)
     workflow.add_node("qual_retriever", qualitative_retriever_agent)
@@ -1001,7 +1209,8 @@ def create_financial_workflow():
     workflow.add_node("verifier_agent", verifier_agent)
     workflow.add_node("recommendation_agent", recommendation_agent)
 
-    workflow.set_entry_point("sql_agent")
+    workflow.set_entry_point("decompose")
+    workflow.add_edge("decompose", "sql_agent")
     workflow.add_edge("sql_agent", "data_agent")
     workflow.add_edge("data_agent", "qual_retriever")
     workflow.add_edge("qual_retriever", "logic_retriever")
@@ -1011,7 +1220,7 @@ def create_financial_workflow():
     workflow.add_edge("recommendation_agent", END)
     return workflow.compile()
 
-# ─────────────────────────── Intent & formatting ───────────────────────────
+# --------------------------- Intent & formatting --------------------------
 def is_financial_query(query: str) -> bool:
     q = query.lower()
     financial_keywords = ["stock","portfolio","market","buy","sell","recommendation","risk","return","shares","p/e","market cap","dividend","investment","ticker"]
@@ -1033,19 +1242,22 @@ def detect_intent(query: str) -> str:
 
 def format_portfolio_response(perf: dict) -> str:
     if not perf or not perf.get("positions"):
-        return "Your portfolio is currently empty. Try: *buy 10 shares of AAPL*."
-    response = "### Your Portfolio Performance\n\n"
-    response += f"**Total Portfolio Value:** ${perf['total_value']:,.2f}\n"
-    response += f"**Total Cost Basis:** ${perf['total_cost']:,.2f}\n"
-    response += f"**Total P&L:** ${perf['total_pnl']:,.2f} ({perf['total_return_pct']:+.2f}%)\n\n"
-    response += "#### Individual Holdings:\n"
+        return "Your portfolio is currently empty. Try: **buy 10 shares of AAPL**."
+    lines = ["### Your Portfolio Performance", ""]
+    lines.append(f"**Total Value:** ${perf['total_value']:,.2f}")
+    lines.append(f"**Total Cost Basis:** ${perf['total_cost']:,.2f}")
+    lines.append(f"**Total P&L:** ${perf['total_pnl']:,.2f} ({perf['total_return_pct']:+.2f}%)")
+    lines.append("")
+    lines.append("#### Individual Holdings")
     for p in perf["positions"]:
-        pnl_emoji = "📈" if p["pnl"] > 0 else "📉" if p["pnl"] < 0 else "➖"
-        cp = p.get("current_price"); cp_str = f"${cp:.2f}" if cp is not None else "—"
-        response += f"**{p['symbol']}** - {p['shares']} shares\n"
-        response += f"  • Current: {cp_str} | Purchase: ${p['purchase_price']:.2f}\n"
-        response += f"  • Value: ${p['current_value']:,.2f} | P&L: {pnl_emoji} ${p['pnl']:+,.2f} ({p['pnl_pct']:+.2f}%)\n\n"
-    return response
+        pnl_emoji = "📈" if p["pnl"] > 0 else ("📉" if p["pnl"] < 0 else "➖")
+        cp = p.get("current_price")
+        cp_str = f"{cp:.2f}" if cp is not None else "—"
+        lines.append(f"**{p['symbol']}** — {p['shares']} shares")
+        lines.append(f"• Current: ${cp_str} | Purchase: ${p['purchase_price']:.2f}")
+        lines.append(f"• Value: ${p['current_value']:,.2f} | P&L: {pnl_emoji} ${p['pnl']:+,.2f} ({p['pnl_pct']:+.2f}%)")
+        lines.append("")
+    return "\n".join(lines)
 
 def validate_query(query: str) -> str:
     if not query or len(query.strip()) == 0: raise ValueError("Query cannot be empty")
@@ -1061,7 +1273,6 @@ def handle_general_query_with_search(query: str, context: str, chat_history: Lis
     history_text = "\n".join(f"User: {m['user']}\nAgent: {m['agent']}" for m in chat_history[-3:])
     file_summary = extract_text_from_pdf(file_path) if file_path else ""
 
-    # Build the prompt parts separately
     context_str = f"Previous conversation context:\n{context}\n" if context else ""
     history_str = f"Recent chat history:\n{history_text}\n" if history_text else ""
     file_str = f"File content summary:\n{file_summary}\n" if file_summary else ""
@@ -1074,18 +1285,20 @@ You are a helpful AI assistant. Provide clear, accurate responses grounded in so
 User's question: {query}
 
 Instructions:
-1) Use search results if available and cite with URLs.
-2) Be direct and concise.
+
+Use search results if available and cite with URLs.
+Be direct and concise.
 Answer:
 """.strip()
     try:
-        return llm_call("analysis", [{"role":"user","content":prompt}], max_tries=2).content
+        return llm_call("analysis", [{"role":"user","content":prompt}], max_tries=1).content
     except Exception as e:
         logger.error(f"LLM request failed: {e}")
         return "I’m having trouble answering that right now."
 
-# ────────────────────────── Public entrypoint ───────────────────────────────
+# ----------------------------- Public entrypoint -------------------------
 portfolio_manager = SecurePortfolioManager()
+
 def initialize_global_instances():
     global rate_limiter, conversation_memory
     if rate_limiter is None:
@@ -1105,17 +1318,21 @@ def run_customer_support(
     if chat_history is None: chat_history = []
     if user_profile is None: user_profile = {}
     if user_requirements is None: user_requirements = {}
-    
+
     initialize_global_instances()
     allowed, remaining = rate_limiter.is_allowed(user_id)
     if not allowed:
         return {"original_language": "English","response":"⚠️ Rate limit exceeded. Please try again later.","raw_response":"Rate limit exceeded"}
+
     try:
         query = validate_query(query)
     except ValueError as e:
         return {"original_language":"English","response":f"❌ Invalid input: {str(e)}","raw_response":str(e)}
 
-    translated_query, detected_lang = translate_input_to_english(query)
+    if detect is None:
+        translated_query, detected_lang = (query, "en")
+    else:
+        translated_query, detected_lang = translate_input_to_english(query)
     context = conversation_memory.get_context_summary(user_id)
     intent = detect_intent(translated_query)
 
@@ -1124,7 +1341,9 @@ def run_customer_support(
         if m:
             shares_str, symbol = m.groups()
             try:
-                current_price = safe_latest_price(symbol.upper())
+                ticker = _get_ticker(symbol.upper())
+                close = ticker.history(period="5d")["Close"].dropna()
+                current_price = float(close.iloc[-1]) if len(close) else None
                 if current_price is None: raise ValueError("price unavailable")
                 shares = float(shares_str.replace(",", ""))
                 success = portfolio_manager.add_to_portfolio(user_id, symbol.upper(), shares, current_price)
@@ -1142,8 +1361,9 @@ def run_customer_support(
         workflow = create_financial_workflow()
         initial_state: FinancialAgentState = {
             "query": translated_query,
-            "user_profile": user_profile,  # Use the passed-in profile
-            "user_requirements": user_requirements, # Use the passed-in requirements
+            "user_profile": user_profile,
+            "user_requirements": user_requirements,
+            "decomposed": {},
             "sql_queries": [], "company_data": [], "market_analysis": "", "fundamental_analysis": "",
             "technical_analysis": [], "recommendations": [], "final_response": "",
         }
@@ -1156,7 +1376,6 @@ def run_customer_support(
     else:
         response = handle_general_query_with_search(translated_query, context, chat_history, file_path)
 
-        # This is the correct sequence: save, translate, then return.
     conversation_memory.add_exchange(user_id, query, response)
     target_lang = force_language if force_language else detected_lang
     translated_response = translate_output_from_english(response, target_lang)
