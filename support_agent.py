@@ -56,6 +56,7 @@ class SecurityManager:
     @staticmethod
     def allowlist_sql(query: str) -> str:
         q = (query or "").strip()
+        # forbid SQL comments
         if re.search(r"--|/\*|\*/", q):
             raise ValueError("SQL comments are not allowed.")
         q = q.replace(";", "")
@@ -84,7 +85,6 @@ def validate_sql_ast(query: str) -> str:
         tables = {t.name.lower() for t in ast.find_all(sqlglot.exp.Table)}
         if not tables.issubset(APPROVED_TABLES):
             raise ValueError(f"Query references non-approved tables: {tables - APPROVED_TABLES}")
-        # Optional extra hardening: disallow UNION via AST
         if any(isinstance(node, sqlglot.exp.Union) for node in ast.find_all(sqlglot.exp.Union)):
             raise ValueError("UNION is not allowed.")
         return safe_q
@@ -393,6 +393,7 @@ def prefilter_symbols_by_query(query_lower: str, spx_df: pd.DataFrame, max_candi
     }
     wanted = {sector for sector, keys in sector_aliases.items() if any(k in query_lower for k in keys)}
     df = spx_df[spx_df["Sector"].isin(sorted(wanted))] if wanted else spx_df
+
     return df["Symbol"].tolist()[:max_candidates]
 
 def get_real_stock_data(symbols: List[str]) -> List[Dict[str, Any]]:
@@ -404,14 +405,19 @@ def get_stocks_by_real_criteria(query: str) -> List[Dict[str, Any]]:
     spx_df = get_sp500_table_cached()
     candidates = prefilter_symbols_by_query(query_lower, spx_df, max_candidates=80) or get_sp500_tickers()[:80]
     real_companies = get_real_stock_data_parallel(candidates[:30])
-    # minimal query filters
+    # minimal query filters with fail-safe not to over-filter
     filtered = real_companies
+    tmp = filtered
     if any(w in query_lower for w in ["tech", "technology", "software"]):
-        filtered = [c for c in filtered if "technology" in c.get("sector", "").lower()]
+        t = [c for c in tmp if "technology" in c.get("sector", "").lower()]
+        if t: tmp = t
     if any(w in query_lower for w in ["safe", "conservative", "stable"]):
-        filtered = [c for c in filtered if (c.get("beta",1.0) < 1.0 and 0 < (c.get("pe_ratio") or 0) < 25 and (c.get("market_cap") or 0) > 1e10)]
+        t = [c for c in tmp if (c.get("beta",1.0) < 1.0 and 0 < (c.get("pe_ratio") or 0) < 25 and (c.get("market_cap") or 0) > 1e10)]
+        if t: tmp = t
     if "under 50" in query_lower or "under $50" in query_lower:
-        filtered = [c for c in filtered if (c.get("price") or 999) < 50]
+        t = [c for c in tmp if (c.get("price") or 999) < 50]
+        if t: tmp = t
+    filtered = tmp
     return filtered[:10] or real_companies[:10]
 
 # ───────────────────────── Rules / constraints ─────────────────────────────
@@ -461,7 +467,6 @@ def numeric_verification(c: dict) -> dict:
                     return {"numeric_ok": True, "numeric_err": ""}
                 else:
                     return {"numeric_ok": False, "numeric_err": f"PE sanity mismatch (calc≈{pe_calc:.1f}, pe={pe:.1f})"}
-        # if no eps, allow but note missing
         if pe >= 0:
             return {"numeric_ok": True, "numeric_err": ""}
         return {"numeric_ok": False, "numeric_err": "negative PE without EPS context"}
@@ -856,7 +861,12 @@ def verifier_agent(state: FinancialAgentState):
         qual_n = sum(1 for p in prov if p.get("type")=="qual")
         logic_n= sum(1 for p in prov if p.get("type")=="logic")
         num_n  = sum(1 for p in prov if p.get("type")=="numeric")
-        conf = 0.25*(1.0 if vr["numeric_ok"] else 0.3) + 0.25*min(1.0, news_n/4.0) + 0.25*min(1.0, (qual_n+logic_n)/4.0) + 0.25*min(1.0, num_n/3.0)
+        conf = (
+            0.25*(1.0 if vr["numeric_ok"] else 0.3)
+            + 0.25*min(1.0, news_n/4.0)
+            + 0.25*min(1.0, (qual_n+logic_n)/4.0)
+            + 0.25*min(1.0, num_n/3.0)
+        )
         enriched.append({**c, "verify_numeric_ok": vr["numeric_ok"], "verify_error": vr["numeric_err"], "confidence": round(conf,2)})
     state["company_data"] = enriched
     return state
@@ -1050,14 +1060,17 @@ def handle_general_query_with_search(query: str, context: str, chat_history: Lis
     web_results = web_search_ddg(query, max_results=3) if should_search else ""
     history_text = "\n".join(f"User: {m['user']}\nAgent: {m['agent']}" for m in chat_history[-3:])
     file_summary = extract_text_from_pdf(file_path) if file_path else ""
+
+    # Build the prompt parts separately
+    context_str = f"Previous conversation context:\n{context}\n" if context else ""
+    history_str = f"Recent chat history:\n{history_text}\n" if history_text else ""
+    file_str = f"File content summary:\n{file_summary}\n" if file_summary else ""
+    web_str = f"Current web search results:\n{web_results}\n" if web_results else ""
+
     prompt = f"""
 You are a helpful AI assistant. Provide clear, accurate responses grounded in sources if given.
 
-{'Previous conversation context:\n' + context + '\n' if context else ''}
-{'Recent chat history:\n' + history_text + '\n' if history_text else ''}
-{'File content summary:\n' + file_summary + '\n' if file_summary else ''}
-{'Current web search results:\n' + web_results + '\n' if web_results else ''}
-
+{context_str}{history_str}{file_str}{web_str}
 User's question: {query}
 
 Instructions:
@@ -1082,17 +1095,21 @@ def initialize_global_instances():
 
 def run_customer_support(
     query: str,
+    user_profile: Optional[Dict] = None,
+    user_requirements: Optional[Dict] = None,
     force_language: Optional[str] = None,
     chat_history: Optional[List[Dict[str, str]]] = None,
     file_path: Optional[str] = None,
     user_id: str = "anonymous_user",
 ) -> Dict[str, Any]:
     if chat_history is None: chat_history = []
+    if user_profile is None: user_profile = {}
+    if user_requirements is None: user_requirements = {}
+    
     initialize_global_instances()
     allowed, remaining = rate_limiter.is_allowed(user_id)
     if not allowed:
         return {"original_language": "English","response":"⚠️ Rate limit exceeded. Please try again later.","raw_response":"Rate limit exceeded"}
-
     try:
         query = validate_query(query)
     except ValueError as e:
@@ -1124,19 +1141,22 @@ def run_customer_support(
     elif intent == "financial_analysis":
         workflow = create_financial_workflow()
         initial_state: FinancialAgentState = {
-            "query": translated_query, "user_profile": {}, "user_requirements": {},
+            "query": translated_query,
+            "user_profile": user_profile,  # Use the passed-in profile
+            "user_requirements": user_requirements, # Use the passed-in requirements
             "sql_queries": [], "company_data": [], "market_analysis": "", "fundamental_analysis": "",
             "technical_analysis": [], "recommendations": [], "final_response": "",
         }
         try:
             result = workflow.invoke(initial_state)
-            response = result["final_response"]
+            response = result.get("final_response", "Analysis complete, but no response was generated.")
         except Exception as e:
             logger.error(f"Financial workflow failed: {e}")
             response = "Sorry, the financial analysis system is temporarily unavailable. Please try again later."
     else:
         response = handle_general_query_with_search(translated_query, context, chat_history, file_path)
 
+        # This is the correct sequence: save, translate, then return.
     conversation_memory.add_exchange(user_id, query, response)
     target_lang = force_language if force_language else detected_lang
     translated_response = translate_output_from_english(response, target_lang)

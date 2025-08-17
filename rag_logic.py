@@ -33,8 +33,7 @@ def _embedder():
     return _EMB
 
 def _paths():
-    return (os.path.join(INDEX_DIR, "faiss.index"),
-            os.path.join(INDEX_DIR, "meta.pkl"))
+    return (os.path.join(INDEX_DIR, "faiss.index"), os.path.join(INDEX_DIR, "meta.pkl"))
 
 def _chunk(text: str, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
     text = (text or "").strip()
@@ -48,7 +47,8 @@ def _load_index():
     meta = {"chunks": [], "vectors": 0}
     index = None
     if os.path.exists(meta_path):
-        with open(meta_path, "rb") as f: meta = pickle.load(f)
+        with open(meta_path, "rb") as f:
+            meta = pickle.load(f)
     if faiss and os.path.exists(idx_path):
         try:
             index = faiss.read_index(idx_path)
@@ -58,7 +58,8 @@ def _load_index():
 
 def _save_index(index, meta):
     idx_path, meta_path = _paths()
-    with open(meta_path, "wb") as f: pickle.dump(meta, f)
+    with open(meta_path, "wb") as f:
+        pickle.dump(meta, f)
     if faiss and index is not None:
         faiss.write_index(index, idx_path)
 
@@ -98,7 +99,8 @@ def add_from_urls_logic(urls: List[str]) -> int:
 
 def retrieve_logic(query: str, k: int = 5) -> List[Dict[str, Any]]:
     index, meta = _load_index()
-    if meta["vectors"] == 0: return []
+    if meta["vectors"] == 0:
+        return []
     emb = _embedder()
     q = emb.encode([query], normalize_embeddings=True, convert_to_numpy=True).astype("float32")
     res=[]

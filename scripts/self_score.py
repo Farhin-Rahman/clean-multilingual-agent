@@ -30,7 +30,7 @@ def check_security():
     pts += 2 if "APPROVED_TABLES" in s else 0
     pts += 1 if "RateLimiter" in s else 0
     pts += 2 if "hash_sensitive_data" in s else 0
-    pts += 2 if re.search(r"with\\|union\\|attach", s, re.I) else 0
+    pts += 2 if re.search(r"with\|union\|attach", s, re.I) else 0
     return min(10, pts)/maxpts*10
 
 def check_reliability():

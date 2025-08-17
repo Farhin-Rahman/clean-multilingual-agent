@@ -66,9 +66,9 @@ def _score_vader(texts: List[str]) -> Optional[float]:
 def sent_score(texts: List[str]) -> float:
     """
     Returns sentiment in [-1, 1].
-      auto: FinBERT → VADER → neutral
-      finbert: FinBERT only (else 0.0)
-      vader: VADER only (else 0.0)
+    auto: FinBERT → VADER → neutral
+    finbert: FinBERT only (else 0.0)
+    vader: VADER only (else 0.0)
     """
     texts = texts or []
     if _ENGINE in ("auto", "finbert"):

@@ -34,8 +34,7 @@ def _embedder():
     return _EMB
 
 def _paths():
-    return (os.path.join(INDEX_DIR, "faiss.index"),
-            os.path.join(INDEX_DIR, "meta.pkl"))
+    return (os.path.join(INDEX_DIR, "faiss.index"), os.path.join(INDEX_DIR, "meta.pkl"))
 
 def _load_index():
     idx_path, meta_path = _paths()
@@ -97,7 +96,8 @@ def add_from_urls_text(urls: List[str]) -> int:
 
 def retrieve_text(query: str, k: int = 5) -> List[Dict[str, Any]]:
     index, meta = _load_index()
-    if meta["vectors"] == 0: return []
+    if meta["vectors"] == 0:
+        return []
     emb = _embedder()
     q = emb.encode([query], normalize_embeddings=True, convert_to_numpy=True).astype("float32")
     results = []
@@ -109,9 +109,10 @@ def retrieve_text(query: str, k: int = 5) -> List[Dict[str, Any]]:
                 results.append({"url": ch["url"], "title": ch["title"], "snippet": ch["text"][:400], "score": float(score)})
     else:
         vecs = np.array(meta.get("vecs", []), dtype="float32")
-        if vecs.size == 0: return []
+        if vecs.size == 0:
+            return []
         sims = (q @ vecs.T)[0]  # cosine on normalized vecs
-        top = np.argsort(sims)[::-1][:min(k, len(meta["chunks"]))]
+        top = np.argsort(sims)[::-1][:min(k, len(meta["chunks"]))] 
         for idx in top:
             ch = meta["chunks"][idx]
             results.append({"url": ch["url"], "title": ch["title"], "snippet": ch["text"][:400], "score": float(sims[idx])})
