@@ -40,7 +40,7 @@ from rag_text import add_from_urls_text, retrieve_text
 from rag_logic import add_from_urls_logic, retrieve_logic, extract_logical as extract_logical_from_hits
 from rag_numeric import ingest_numeric_for_symbols, numeric_retrieve
 
-# Sentiment (FinBERT primary, VADER fallback handled in sent backend)
+# Sentiment (FinBERT primary, VADER fallback handled in sentiment backend)
 from sentiment_backend import sent_score as _sent_score
 
 load_dotenv()
@@ -65,6 +65,14 @@ YF_MAX_SYMBOLS = int(os.getenv("YF_MAX_SYMBOLS", "8"))  # keep small to avoid th
 SP500_CACHE_FILE = "sp500_cache.csv"
 SP500_CACHE_TTL_HOURS = 24
 SP500_FULL_CACHE_FILE = "sp500_full_cache.csv"
+
+# ---- Performance budget knob (added) ----
+AGENT_BUDGET_MS = int(os.getenv("AGENT_BUDGET_MS", "1200"))
+
+def _over_budget(state) -> bool:
+    """Return True if we've exceeded the overall agent time budget."""
+    t0 = state.get("budget_t0")
+    return bool(t0) and ((time.time() - t0) * 1000.0 > AGENT_BUDGET_MS)
 
 # ------------------------------ Security ---------------------------------
 class SecurityManager:
@@ -253,9 +261,9 @@ def llm_call(task: str, messages: List[Dict[str, str]], max_tries: int = 2) -> _
         return _LLMResponse(stub)
     return _LLMResponse("—")
 
-# ==============================================================================
-# =================== PRICE HISTORY (YF → STOOQ → SYNTHETIC) ==================
-# ==============================================================================
+# ======================================================================
+# =================== PRICE HISTORY (YF → STOOQ → SYNTHETIC) ===========
+# ======================================================================
 
 # Small fundamentals fallback (to print nicer details in bullets)
 FUND_FALLBACK = {
@@ -337,25 +345,61 @@ def _compute_beta(sym_close: pd.Series, mkt_close: pd.Series) -> float:
     except Exception:
         return 1.0
 
+# ---------- DDG with retry (added) ----------
+@retry(wait=wait_exponential(min=0.2, max=2.0), stop=stop_after_attempt(3))
+def _safe_ddg_text(query: str, max_results: int = 5):
+    with DDGS() as ddgs:
+        return list(ddgs.text(query, max_results=max_results))
+
 def _headlines_for_symbol(sym: str, max_n: int = 6) -> List[dict]:
     """Use DuckDuckGo (shimmed in demo) for headlines."""
     items: List[dict] = []
     try:
-        with DDGS() as ddgs:
-            q = f'{sym} stock news site:reuters.com OR site:barrons.com OR site:bloomberg.com OR site:investors.com OR site:cnbc.com'
-            for r in ddgs.text(q, max_results=max_n):
-                t = (r.get("title") or "").strip()
-                u = (r.get("href") or "").strip()
-                if t and u and u.startswith("http"):
-                    items.append({"title": t, "url": u, "publisher": "", "date": ""})
+        q = f'{sym} stock news site:reuters.com OR site:barrons.com OR site:bloomberg.com OR site:investors.com OR site:cnbc.com'
+        for r in _safe_ddg_text(q, max_n):
+            t = (r.get("title") or "").strip()
+            u = (r.get("href") or "").strip()
+            if t and u and u.startswith("http"):
+                items.append({"title": t, "url": u, "publisher": "", "date": ""})
     except Exception:
         pass
     return items[:max_n]
 
 def _download_closes(symbols: List[str]) -> dict[str, pd.Series]:
-    """Uniformly get close series via fetch_history to avoid Yahoo 429s."""
+    """Uniformly get close series via fast multi-ticker path when live, else robust fallback."""
+    syms = list(dict.fromkeys([s for s in symbols if s]))  # dedupe/preserve order
     out: dict[str, pd.Series] = {}
-    for sym in symbols:
+
+    # Fast path: multi-ticker yf.download if shim is OFF
+    try:
+        if os.getenv("SHIM_YF", "1") == "0" and syms:
+            df = yf.download(
+                syms, period="6mo", interval="1d",
+                auto_adjust=True, threads=True, progress=False
+            )
+            # MultiIndex (Close, TICKER) when multiple; plain 'Close' for single
+            if isinstance(df.columns, pd.MultiIndex):
+                if "Close" in df.columns.get_level_values(0):
+                    for s in syms:
+                        try:
+                            series = df[("Close", s)].dropna()
+                            if not series.empty:
+                                out[s] = series
+                        except Exception:
+                            continue
+            elif "Close" in df:
+                s0 = syms[0]
+                series = df["Close"].dropna()
+                if not series.empty:
+                    out[s0] = series
+    except Exception:
+        pass
+
+    if out:
+        return out
+
+    # Fallback: per-symbol robust path via fetch_history (includes Stooq/synthetic)
+    for sym in syms:
         try:
             df = fetch_history(sym, days=160)
             s = df["Close"].dropna()
@@ -366,7 +410,7 @@ def _download_closes(symbols: List[str]) -> dict[str, pd.Series]:
     return out
 
 def get_real_stock_data_parallel(symbols: List[str]) -> List[Dict[str, Any]]:
-    """Close prices via Stooq (or YF if allowed), indicators + FinBERT sentiment."""
+    """Close prices via Stooq (or YF if allowed), indicators + FinBERT/VADER sentiment."""
     syms = list(dict.fromkeys([s for s in symbols if s]))[:max(1, YF_MAX_SYMBOLS)]
     out: List[Dict[str, Any]] = []
     if not syms:
@@ -576,6 +620,11 @@ def numeric_verification(c: dict) -> dict:
     except Exception as e:
         return {"numeric_ok": False, "numeric_err": f"exception {e}"}
 
+# ---- Provenance gate (added) ----
+def _meets_provenance_gate(c: dict) -> bool:
+    p = c.get("provenance", []) or []
+    return any((x or {}).get("type") in {"news", "qual", "logic", "numeric"} for x in p)
+
 def _norm01(x: float, lo: float, hi: float) -> float:
     try:
         if hi <= lo: return 0.0
@@ -678,8 +727,7 @@ def extract_text_from_pdf(file_path: str) -> str:
 
 def web_search_ddg(query: str, max_results: int = 3) -> str:
     try:
-        with DDGS() as ddgs:
-            results = list(ddgs.text(query, max_results=max_results))
+        results = _safe_ddg_text(query, max_results=max_results)
         if not results:
             return "No web search results found."
         out = "Recent web search results:\n\n"
@@ -807,6 +855,7 @@ class FinancialAgentState(TypedDict):
     technical_analysis: List[Dict]
     recommendations: List[Dict]
     final_response: str
+    budget_t0: float  # added for time budget
 
 # --------------------------- Query Decomposition -------------------------
 def query_decomposition_agent(state: FinancialAgentState):
@@ -933,6 +982,10 @@ Discuss sector trends and risk.
 
 # ------------------------------- RAG agents -------------------------------
 def qualitative_retriever_agent(state: FinancialAgentState):
+    # skip if budget exceeded (added)
+    if _over_budget(state):
+        return state
+
     syms = [c["symbol"] for c in state.get("company_data", [])][:5]
     urls = set()
     decomp = state.get("decomposed", {})
@@ -941,10 +994,9 @@ def qualitative_retriever_agent(state: FinancialAgentState):
 
     for s in syms:
         try:
-            with DDGS() as ddgs:
-                for r in ddgs.text(f"{s} investment thesis analysis {kw}", max_results=5):
-                    if (r.get("href") or "").startswith("http"):
-                        urls.add(r["href"])
+            for r in _safe_ddg_text(f"{s} investment thesis analysis {kw}", 5):
+                if (r.get("href") or "").startswith("http"):
+                    urls.add(r["href"])
         except Exception as e:
             logger.warning(f"QUAL RAG DDG failed for {s}: {e}")
             continue
@@ -972,6 +1024,10 @@ def qualitative_retriever_agent(state: FinancialAgentState):
     return state
 
 def logical_retriever_agent(state: FinancialAgentState):
+    # skip if budget exceeded (added)
+    if _over_budget(state):
+        return state
+
     syms = [c["symbol"] for c in state.get("company_data", [])][:5]
     urls = set()
     logger.info(f"LOGIC RAG: Starting search for symbols: {syms}")
@@ -983,14 +1039,12 @@ def logical_retriever_agent(state: FinancialAgentState):
         ]
         for q in queries:
             try:
-                with DDGS() as ddgs:
-                    for r in ddgs.text(q, max_results=5):
-                        href = (r.get("href") or "").strip()
-                        if href.startswith("http"):
-                            urls.add(href)
+                for r in _safe_ddg_text(q, 5):
+                    href = (r.get("href") or "").strip()
+                    if href.startswith("http"):
+                        urls.add(href)
             except Exception as e:
                 logger.warning(f"LOGIC RAG DDG failed for {s}: {e}")
-                # just move on to the next query
                 continue
 
     logger.info(f"LOGIC RAG: Found {len(urls)} unique URLs to process.")
@@ -1020,6 +1074,10 @@ def logical_retriever_agent(state: FinancialAgentState):
 
 
 def numeric_retriever_agent(state: FinancialAgentState):
+    # skip if budget exceeded (added)
+    if _over_budget(state):
+        return state
+
     syms = [c["symbol"] for c in state.get("company_data", [])][:5]
     try:
         ingest_numeric_for_symbols(syms)
@@ -1127,6 +1185,14 @@ def recommendation_agent(state: FinancialAgentState):
         num  = [p for p in prov if p.get("type")=="numeric"][:1]
         sources = news + qual + logic + num
 
+        # provenance gate (added): downweight/flag if no evidence
+        gate_ok = _meets_provenance_gate(c)
+        if not gate_ok:
+            score = max(0.0, score - 0.10)
+            rules_flags = list(set((gate["flags"] or []) + rules["flags"] + ["low_provenance"]))
+        else:
+            rules_flags = list(set((gate["flags"] or []) + rules["flags"]))
+
         rationale = (
             f"PE={c.get('pe_ratio')} • Beta={c.get('beta')} • Vol≈{c.get('volatility')} • "
             f"RSI={c.get('rsi')} • Trend={c.get('trend')} • Sent={c.get('sentiment',0):+.2f} • "
@@ -1136,7 +1202,7 @@ def recommendation_agent(state: FinancialAgentState):
             "company": c["name"], "symbol": c["symbol"], "sector": c["sector"],
             "price": c["price"], "pe_ratio": c.get("pe_ratio"), "market_cap": c.get("market_cap"),
             "risk": c.get("risk"), "score": score, "features": feats, "confidence": c.get("confidence",0.0),
-            "flags": list(set((gate["flags"] or []) + rules["flags"])), "rationale": rationale,
+            "flags": rules_flags, "rationale": rationale,
             "dividend_yield": c.get("dividend_yield"),
             "rsi": c.get("rsi"), "trend": c.get("trend"), "beta": c.get("beta"), "volatility": c.get("volatility"),
             "sources": [{"title":s.get("title",""),"url":s.get("url",""),"date":s.get("date","")} for s in sources if s.get("url","") or s.get("title","")],
@@ -1339,6 +1405,7 @@ def run_customer_support(
             "decomposed": {},
             "sql_queries": [], "company_data": [], "market_analysis": "", "fundamental_analysis": "",
             "technical_analysis": [], "recommendations": [], "final_response": "",
+            "budget_t0": time.time(),  # start overall budget timer (added)
         }
         try:
             result = workflow.invoke(initial_state)
