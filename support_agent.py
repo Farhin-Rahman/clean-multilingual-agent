@@ -1412,7 +1412,7 @@ def run_customer_support(
             response = result.get("final_response", "Analysis complete, but no response was generated.")
         except Exception as e:
             logger.error(f"Financial workflow failed: {e}")
-            response = "Sorry, the financial analysis system is temporarily unavailable. Please try again later."
+            response = "Sorry, the      financial analysis system is temporarily unavailable. Please try again later."
     else:
         response = handle_general_query_with_search(translated_query, context, chat_history, file_path)
 
