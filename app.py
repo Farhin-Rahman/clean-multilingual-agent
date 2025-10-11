@@ -1,17 +1,42 @@
-# app.py — Streamlit UI for the Financial Support Agent (free-first)
+# ========================== Early env load ==========================
+from dotenv import load_dotenv, find_dotenv
+import os, pathlib
 
-import os
+# Load .env from the project root ASAP (before any other imports use env vars)
+load_dotenv(find_dotenv(usecwd=True))
+
+# Ensure SEC_USER_AGENT is set (quiet the SEC warning from downstream code)
+os.environ.setdefault(
+    "SEC_USER_AGENT",
+    os.getenv("SEC_USER_AGENT", "Streamlit App nobody@example.com"),
+)
+
+# Quick probe so you can see what's happening in the terminal
+print("CWD:", pathlib.Path().resolve())
+print("Has GROQ_API_KEY?", bool(os.getenv("GROQ_API_KEY")))
+print("Has SEC_USER_AGENT?", bool(os.getenv("SEC_USER_AGENT")))
+
+# ============================= Imports ==============================
 import base64
 import tempfile
 import hashlib
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import streamlit as st
-from dotenv import load_dotenv
 
 from support_agent import run_customer_support, is_financial_query
+# SAFE import of the preset
+try:
+    from support_agent import ACADEMIC_PRESET
+except Exception:
+    ACADEMIC_PRESET = None
+from services.provider_router import healthcheck, routing_mode
+from services.charts import create_all_charts
+from rag.attachments import AttachmentIndex, process_attachment_file
+from services.files import extract_text_from_file, split_chunks
+from services.ocr import extract_text_from_image, is_image_file
 
 # ---------- Optional voice/TTS dependencies (guarded) ----------
 try:
@@ -34,16 +59,25 @@ except Exception:
 
 
 # ============================ Setup ============================
-load_dotenv()
 st.set_page_config(
     page_title="AI Financial Assistant",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",   # collapsed for everyone by default
     page_icon="🤖",
 )
 
+# Optional: set to True to hide sidebar completely (no hamburger toggle)
+HIDE_SIDEBAR = False
+if HIDE_SIDEBAR:
+    st.markdown("""
+    <style>
+      [data-testid="stSidebar"] { display: none !important; }
+      [data-testid="stSidebarCollapsedControl"] { display: none !important; }
+    </style>
+    """, unsafe_allow_html=True)
+
+
 # ===================== Enrichment / Normalizer ======================
-# Converts the agent’s verbose "Market Analysis ... Top Picks" block into a clean investor-style list.
 def _enrich_recommendations(markdown_text: str) -> str:
     import re
     import numpy as np
@@ -52,7 +86,7 @@ def _enrich_recommendations(markdown_text: str) -> str:
 
     risk_label = st.session_state.get("risk_tolerance", "Moderate")
 
-    def _rsi(series: pd.Series, n: int = 14):
+    def _rsi(series: "pd.Series", n: int = 14):
         if series is None or len(series) < n + 5:
             return None
         d = series.diff()
@@ -78,31 +112,22 @@ def _enrich_recommendations(markdown_text: str) -> str:
         lines = markdown_text.splitlines()
         picks = []
 
-        # Grab lines that start with "- **Name** (SYM)"
         for line in lines:
             if line.lstrip().startswith("- **"):
-                # Name + ticker
                 m1 = re.match(r"\s*-\s*\*\*(.+?)\*\*\s+\(([A-Z.\-]{1,8})\)", line)
                 if not m1:
                     continue
                 name, sym = m1.group(1), m1.group(2)
-
-                # Price (first $number on the line)
                 m_price = re.search(r"\$\s*([0-9][0-9,]*\.?[0-9]*)", line)
                 price = float(m_price.group(1).replace(",", "")) if m_price else None
-
-                # score and conf anywhere on the line
                 m_score = re.search(r"score\s+([0-9.]+)", line, re.I)
                 score = float(m_score.group(1)) if m_score else None
                 m_conf = re.search(r"Conf\s+([0-9.]+)", line, re.I)
                 conf = float(m_conf.group(1)) if m_conf else None
-
                 picks.append((name, sym, price, score, conf))
 
-        # Build a neat section with richer bullets from shimmed yfinance
         out = [f"### Safe stock suggestions ({risk_label})", ""]
         for name, sym, price, score, conf in picks:
-            # Pull info & history
             try:
                 t = yf.Ticker(sym)
                 info = getattr(t, "info", {}) or {}
@@ -111,116 +136,7 @@ def _enrich_recommendations(markdown_text: str) -> str:
             except Exception:
                 info, close = {}, None
 
-            rsi = _rsi(close)
-            sma50 = float(close.rolling(50).mean().iloc[-1]) if (close is not None and len(close) >= 50) else None
-            trend = "Bullish" if (close is not None and sma50 is not None and close.iloc[-1] > sma50) else "Bearish"
-            vol20 = (
-                float(close.pct_change().rolling(20).std().iloc[-1] * (252 ** 0.5))
-                if (close is not None and len(close) >= 40)
-                else None
-            )
-
-            sector = info.get("sector")
-            industry = info.get("industry")
-            beta = info.get("beta")
-            dy = info.get("dividendYield")
-            pe = info.get("trailingPE")
-            mcap = info.get("marketCap")
-            debt = info.get("totalDebt")
-            ebitda = info.get("ebitda")
-            debt_ebitda = (debt / ebitda) if isinstance(debt, (int, float)) and isinstance(ebitda, (int, float)) and ebitda else None
-
-            out.append(_mk_pick_line(name, sym, price, score, conf))
-
-            # Bullet rows
-            bullets = []
-            prof = []
-            if sector:
-                prof.append(sector + (f" — {industry}" if industry else ""))
-            if isinstance(beta, (int, float)):
-                prof.append(f"β≈{beta:.2f}")
-            if isinstance(dy, (int, float)) and dy > 0:
-                prof.append(f"DY≈{dy*100:.1f}%")
-            if prof:
-                bullets.append("Profile: " + " • ".join(prof))
-
-            val = []
-            if isinstance(pe, (int, float)):
-                val.append(f"P/E≈{pe:.1f}x")
-            if isinstance(mcap, (int, float)):
-                val.append(f"Cap≈${mcap/1e9:.0f}B")
-            if val:
-                bullets.append("Valuation: " + " • ".join(val))
-
-            mom = []
-            if rsi is not None:
-                mom.append(f"RSI {rsi:.0f}")
-            if sma50 is not None and close is not None:
-                mom.append(f"Trend {trend}")
-            if vol20 is not None:
-                mom.append(f"σ20d≈{vol20*100:.1f}%")
-            if mom:
-                bullets.append("Momentum & risk: " + " • ".join(mom))
-
-            if debt_ebitda is not None:
-                bullets.append(f"Balance sheet: Debt/EBITDA≈{debt_ebitda:.1f}×")
-
-            # Short reason
-            bullets.append(
-                "Why it screens as *defensive*: below-market β and/or dividend cushion, "
-                "neutral-to-positive trend, and non-stretched multiples (demo data)."
-            )
-
-            out.extend([f"    - {b}" for b in bullets])
-            out.append("")
-
-        # Remove any “Note:” rows if they existed
-        cleaned = [ln for ln in out if not ln.strip().startswith("Note:")]
-        return "\n".join(cleaned)
-
-    # -------- Path B: already neat bullets (fallback to enrich) --------
-    # Matches lines like: "Name (TICKER) — $Price · score X · conf Y"
-    try:
-        import pandas as pd
-        import yfinance as yf
-
-        lines = markdown_text.splitlines()
-        pick_re = re.compile(
-            r"""\s*(?:\d+\.|\-|\u2022)?\s*
-                ([A-Za-z0-9 .&'/-]+)\s+\(
-                ([A-Z.\-]{1,8})\)\s+—\s+\$
-                ([0-9.,]+).*?score\s+([0-9.]+).*?conf\s+([0-9.]+)""",
-            re.VERBOSE | re.IGNORECASE,
-        )
-        out = []
-        any_match = False
-        for ln in lines:
-            if ln.strip().startswith("Note:"):
-                continue
-            m = pick_re.match(ln)
-            if not m:
-                out.append(ln)
-                continue
-            any_match = True
-            name, sym, price_s, score_s, conf_s = m.groups()
-            try:
-                price = float(price_s.replace(",", ""))
-            except Exception:
-                price = None
-            score = float(score_s)
-            conf = float(conf_s)
-
-            # Pull data
-            try:
-                t = yf.Ticker(sym)
-                info = getattr(t, "info", {}) or {}
-                hist = t.history()
-                close = hist["Close"] if "Close" in hist else None
-            except Exception:
-                info, close = {}, None
-
-            # calc metrics
-            def _rsi(series: pd.Series, n: int = 14):
+            def _rsi(series: "pd.Series", n: int = 14):
                 if series is None or len(series) < n + 5:
                     return None
                 d = series.diff()
@@ -254,8 +170,8 @@ def _enrich_recommendations(markdown_text: str) -> str:
             ebitda = info.get("ebitda")
             debt_ebitda = (debt / ebitda) if isinstance(debt, (int, float)) and isinstance(ebitda, (int, float)) and ebitda else None
 
-            # rebuild
             out.append(_mk_pick_line(name, sym, price, score, conf))
+
             bullets = []
             prof = []
             if sector:
@@ -266,6 +182,7 @@ def _enrich_recommendations(markdown_text: str) -> str:
                 prof.append(f"DY≈{dy*100:.1f}%")
             if prof:
                 bullets.append("Profile: " + " • ".join(prof))
+
             val = []
             if isinstance(pe, (int, float)):
                 val.append(f"P/E≈{pe:.1f}x")
@@ -273,6 +190,7 @@ def _enrich_recommendations(markdown_text: str) -> str:
                 val.append(f"Cap≈${mcap/1e9:.0f}B")
             if val:
                 bullets.append("Valuation: " + " • ".join(val))
+
             mom = []
             if rsi is not None:
                 mom.append(f"RSI {rsi:.0f}")
@@ -282,21 +200,117 @@ def _enrich_recommendations(markdown_text: str) -> str:
                 mom.append(f"σ20d≈{vol20*100:.1f}%")
             if mom:
                 bullets.append("Momentum & risk: " + " • ".join(mom))
+
             if debt_ebitda is not None:
                 bullets.append(f"Balance sheet: Debt/EBITDA≈{debt_ebitda:.1f}×")
+
             bullets.append(
                 "Why it screens as *defensive*: below-market β and/or dividend cushion, "
                 "neutral-to-positive trend, and non-stretched multiples (demo data)."
             )
             out.extend([f"    - {b}" for b in bullets])
             out.append("")
+
+        cleaned = [ln for ln in out if not ln.strip().startswith("Note:")]
+        return "\n".join(cleaned)
+
+    # -------- Path B (fallback) --------
+    try:
+        import re
+        import pandas as pd
+        import yfinance as yf
+        pick_re = re.compile(
+            r"""\s*(?:\d+\.|\-|\u2022)?\s*
+                ([A-Za-z0-9 .&'/-]+)\s+\(
+                ([A-Z.\-]{1,8})\)\s+—\s+\$
+                ([0-9.,]+).*?score\s+([0-9.]+).*?conf\s+([0-9.]+)""",
+            re.VERBOSE | re.IGNORECASE,
+        )
+        lines = markdown_text.splitlines()
+        out, any_match = [], False
+        for ln in lines:
+            if ln.strip().startswith("Note:"):
+                continue
+            m = pick_re.match(ln)
+            if not m:
+                out.append(ln)
+                continue
+            any_match = True
+            name, sym, price_s, score_s, conf_s = m.groups()
+            try:
+                price = float(price_s.replace(",", ""))
+            except Exception:
+                price = None
+            score = float(score_s)
+            conf = float(conf_s)
+            try:
+                t = yf.Ticker(sym)
+                info = getattr(t, "info", {}) or {}
+                hist = t.history()
+                close = hist["Close"] if "Close" in hist else None
+            except Exception:
+                info, close = {}, None
+
+            def _rsi(series: "pd.Series", n: int = 14):
+                if series is None or len(series) < n + 5:
+                    return None
+                d = series.diff()
+                up = d.clip(lower=0.0)
+                down = -d.clip(upper=0.0)
+                roll_up = up.rolling(n).mean()
+                roll_down = down.rolling(n).mean()
+                rs = roll_up / (roll_down + 1e-12)
+                rsi = 100 - (100 / (1 + rs))
+                try:
+                    return float(rsi.iloc[-1])
+                except Exception:
+                    return None
+
+            rsi = _rsi(close)
+            sma50 = float(close.rolling(50).mean().iloc[-1]) if (close is not None and len(close) >= 50) else None
+            trend = "Bullish" if (close is not None and sma50 is not None and close.iloc[-1] > sma50) else "Bearish"
+            vol20 = (
+                float(close.pct_change().rolling(20).std().iloc[-1] * (252 ** 0.5))
+                if (close is not None and len(close) >= 40)
+                else None
+            )
+            sector = info.get("sector"); industry = info.get("industry")
+            beta = info.get("beta"); dy = info.get("dividendYield")
+            pe = info.get("trailingPE"); mcap = info.get("marketCap")
+            debt = info.get("totalDebt"); ebitda = info.get("ebitda")
+            debt_ebitda = (debt / ebitda) if isinstance(debt, (int, float)) and isinstance(ebitda, (int, float)) and ebitda else None
+
+            def _mk_pick_line(name, sym, price, score, conf):
+                price_part = f"${price:,.2f}" if isinstance(price, (int, float)) else "$—"
+                score_part = f"{score:.3f}" if isinstance(score, (int, float)) else "—"
+                conf_part = f"{conf:.2f}" if isinstance(conf, (int, float)) else "—"
+                return f"- {name} ({sym}) — {price_part} · score {score_part} · conf {conf_part}"
+
+            out.append(_mk_pick_line(name, sym, price, score, conf))
+            bullets = []
+            prof = []
+            if sector: prof.append(sector + (f" — {industry}" if industry else ""))
+            if isinstance(beta, (int, float)): prof.append(f"β≈{beta:.2f}")
+            if isinstance(dy, (int, float)) and dy > 0: prof.append(f"DY≈{dy*100:.1f}%")
+            if prof: bullets.append("Profile: " + " • ".join(prof))
+            val = []
+            if isinstance(pe, (int, float)): val.append(f"P/E≈{pe:.1f}x")
+            if isinstance(mcap, (int, float)): val.append(f"Cap≈${mcap/1e9:.0f}B")
+            if val: bullets.append("Valuation: " + " • ".join(val))
+            mom = []
+            if rsi is not None: mom.append(f"RSI {rsi:.0f}")
+            if sma50 is not None and close is not None: mom.append(f"Trend {trend}")
+            if vol20 is not None: mom.append(f"σ20d≈{vol20*100:.1f}%")
+            if mom: bullets.append("Momentum & risk: " + " • ".join(mom))
+            if debt_ebitda is not None: bullets.append(f"Balance sheet: Debt/EBITDA≈{debt_ebitda:.1f}×")
+            bullets.append("Why it screens as *defensive*: below-market β and/or dividend cushion, neutral-to-positive trend, and non-stretched multiples (demo data).")
+            out.extend([f"    - {b}" for b in bullets]); out.append("")
         if any_match:
             header = f"### Safe stock suggestions ({risk_label})\n"
             return header + "\n".join(out)
     except Exception:
         pass
 
-    # Nothing matched, just remove any “Note:” lines
     cleaned = "\n".join([ln for ln in markdown_text.splitlines() if not ln.strip().startswith("Note:")])
     return cleaned
 
@@ -306,7 +320,25 @@ st.markdown(
     """
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap');
-#MainMenu, .stDeployButton, footer, header { visibility: hidden; }
+/* Hide menu/deploy/footer ONLY — keep header & sidebar visible */
+#MainMenu, .stDeployButton, footer { visibility: hidden; }
+
+/* Force the sidebar to be visible and expanded */
+section[data-testid="stSidebar"]{
+  visibility: visible !important;
+  transform: none !important;            /* overrides collapsed translate */
+  width: 20rem !important;
+  min-width: 20rem !important;
+}
+
+/* Make sure the hamburger/toggle is visible */
+header { visibility: visible !important; }
+header [data-testid="collapsedControl"]{
+  visibility: visible !important;
+  opacity: 1 !important;
+  pointer-events: auto !important;
+}
+
 .main { background: radial-gradient(circle at 20% 20%, rgba(200,180,255,.1), transparent 30%),
                     radial-gradient(circle at 80% 80%, rgba(180,220,255,.1), transparent 30%), #FFFFFF;
         font-family: 'Inter', sans-serif; }
@@ -384,6 +416,40 @@ def generate_tts_audio(text: str) -> str:
         return "<p><em>Audio generation temporarily unavailable</em></p>"
 
 
+# ---------- Helper: synthesize snippets from processed attachments ----------
+def _synthesize_attachment_snippet(sources, char_limit_per_file=1500, total_limit=5000):
+    """
+    Builds a short text snippet from uploaded images (OCR) and docs (text),
+    so the LLM can use them even without a vision model.
+    """
+    if not sources:
+        return ""
+    parts, total = [], 0
+    for s in sources:
+        try:
+            path = s.get("path")
+            if not path:
+                continue
+            if s.get("type") == "image":
+                txt = extract_text_from_image(path) or ""
+            else:
+                txt = extract_text_from_file(path) or ""
+            if not txt.strip():
+                continue
+            snippet = txt.strip()[:char_limit_per_file]
+            tag = f"[{os.path.basename(path)}]"
+            piece = f"{tag}\n{snippet}"
+            if total + len(piece) > total_limit:
+                break
+            parts.append(piece)
+            total += len(piece)
+        except Exception:
+            continue
+    if not parts:
+        return ""
+    return "\n\n".join(parts)
+
+
 # ======================= Session State =========================
 if "messages" not in st.session_state:
     st.session_state.messages = []  # [{role: "user"|"agent", content: str}]
@@ -406,12 +472,30 @@ if st.session_state.clear_query:
 with st.sidebar:
     st.markdown("### ⚙️ Settings")
 
-    display_language = st.selectbox(
-        "Response language:",
-        ["Auto (detect)", "English", "Spanish", "French", "German", "Bengali", "Italian", "Portuguese"],
+    # NOTE: removed the old single-file uploader to prevent duplicates
+
+    # New attachment uploaders (with keys so Streamlit persists them cleanly)
+    st.markdown("### 📎 Attachments")
+    uploaded_images = st.file_uploader(
+        "🖼️ Images (PNG/JPG/JPEG/WEBP)",
+        type=["png", "jpg", "jpeg", "webp"],
+        accept_multiple_files=True,
+        help="Upload images for OCR text extraction",
+        key="attachments_images",
+    )
+    uploaded_docs = st.file_uploader(
+        "📄 Documents (PDF/TXT)",
+        type=["pdf", "txt"],
+        accept_multiple_files=True,
+        help="Upload documents for text analysis",
+        key="attachments_docs",
     )
 
-    uploaded_file = st.file_uploader("📎 Upload file (PDF or TXT)", type=["pdf", "txt"])
+    # Quick visual confirmation of what the app has processed
+    if st.session_state.get("attachments_sources"):
+        with st.expander("Processed attachments", expanded=True):
+            for s in st.session_state["attachments_sources"]:
+                st.write(f"- {s['type']}: **{os.path.basename(s['path'])}**")
 
     st.markdown("### 📊 Financial Analysis Settings")
     st.session_state.is_financial_mode = st.checkbox(
@@ -431,6 +515,58 @@ with st.sidebar:
             value="Medium-term",
         )
 
+    # --- Academic mode & user requirements (init + merge) ---
+    # Initialize in session_state once
+    if "user_requirements" not in st.session_state:
+        st.session_state["user_requirements"] = {}
+
+    # Work on a copy for this run
+    user_requirements = dict(st.session_state["user_requirements"])
+
+    academic_mode = st.sidebar.toggle("Academic mode", value=False)
+
+    if academic_mode:
+        preset = ACADEMIC_PRESET or {
+            "risk_tolerance": "Conservative",
+            "investment_timeline": "Medium-term",
+            "weights": {"valuation":0.30, "risk":0.35, "momentum":0.15, "size":0.15, "sentiment":0.05},
+            "style": "academic",
+            "require_primary_sources": True,
+        }
+        user_requirements.update(preset)
+
+    # Persist any changes back into session state
+    st.session_state["user_requirements"] = user_requirements
+
+    # LLM Routing Controls
+    st.markdown("### 🤖 LLM Settings")
+    llm_routing = st.selectbox(
+        "LLM Routing:",
+        ["Auto", "Single", "Consensus (if available)"],
+        index=0,
+        help="Auto: Use best available provider. Single: Use primary provider. Consensus: Use multiple providers with judge."
+    )
+    
+    routing_map = {"Auto": "auto", "Single": "single", "Consensus (if available)": "consensus"}
+    st.session_state["llm_routing"] = routing_map[llm_routing]
+    
+    # High fidelity toggle
+    high_fidelity = st.checkbox(
+        "High Fidelity Mode",
+        value=False,
+        help="Enable consensus mode for investment decisions and portfolio management"
+    )
+    st.session_state["high_fidelity"] = high_fidelity
+    
+    # Provider status
+    try:
+        provider_status = healthcheck()
+        groq_status = "ready" if provider_status.get("groq") == "ready" else "missing"
+        ollama_status = "online" if provider_status.get("ollama") == "online" else "offline"
+        st.markdown(f"**LLM Status:** Groq [{groq_status}] • Ollama [{ollama_status}]")
+    except Exception:
+        st.markdown("**LLM Status:** Unable to check provider status")
+
     lang_map = {
         "Auto (detect)": None,
         "English": "en",
@@ -445,17 +581,6 @@ with st.sidebar:
     if st.button("🔄 Start New Conversation"):
         st.session_state.clear()
         st.rerun()
-
-    st.markdown("---")
-    st.markdown("### 🛠️ Database Management")
-    if st.button("Pre-load Company Database"):
-        try:
-            from populate_db import populate_company_data
-            with st.spinner("Fetching data for ~500 S&P companies... This may take several minutes."):
-                populate_company_data()
-            st.success("Database populated successfully!")
-        except Exception as e:
-            st.error(f"Failed to populate database: {e}")
 
 
 # ========================== Header ============================
@@ -533,24 +658,44 @@ with col2:
         if query.strip():
             st.session_state.messages.append({"role": "user", "content": query})
 
-            # ----- File handling -----
-            uploaded_file = st.session_state.get("uploaded_file") or uploaded_file  # keep reference
-            file_path = None
-            appended_text = ""
-            if uploaded_file is not None:
-                if uploaded_file.type == "application/pdf":
-                    safe_name = "".join(c for c in uploaded_file.name if c.isalnum() or c in ("-", "_", "."))
-                    save_path = UPLOAD_DIR / safe_name
-                    with save_path.open("wb") as f:
-                        f.write(uploaded_file.read())
-                    file_path = str(save_path.resolve())
-                else:
-                    try:
-                        txt = uploaded_file.read().decode(errors="ignore")
-                    except Exception:
-                        txt = ""
-                    if txt:
-                        appended_text = f"\n\n[Attached note]\n{txt[:2000]}"
+            # ----- Attachment processing -----
+            attachments_index = st.session_state.get("attachments_index")
+            attachments_sources = st.session_state.get("attachments_sources", [])
+
+            # Process current uploads (images/docs)
+            if uploaded_images or uploaded_docs:
+                try:
+                    attachments_index = AttachmentIndex()
+                    images_dir = UPLOAD_DIR / "images"; images_dir.mkdir(exist_ok=True)
+                    docs_dir = UPLOAD_DIR / "docs"; docs_dir.mkdir(exist_ok=True)
+
+                    for img_file in (uploaded_images or []):
+                        safe = "".join(c for c in img_file.name if c.isalnum() or c in ("-", "_", "."))
+                        save_path = images_dir / safe
+                        with save_path.open("wb") as f: f.write(img_file.read())
+                        if process_attachment_file(str(save_path), attachments_index):
+                            attachments_sources.append({"type": "image", "name": img_file.name, "path": str(save_path)})
+
+                    for doc_file in (uploaded_docs or []):
+                        safe = "".join(c for c in doc_file.name if c.isalnum() or c in ("-", "_", "."))
+                        save_path = docs_dir / safe
+                        with save_path.open("wb") as f: f.write(doc_file.read())
+                        if process_attachment_file(str(save_path), attachments_index):
+                            attachments_sources.append({"type": "document", "name": doc_file.name, "path": str(save_path)})
+
+                    if getattr(attachments_index, "texts", None):
+                        attachments_index.build()
+                        st.session_state.attachments_index = attachments_index
+                        st.session_state.attachments_sources = attachments_sources
+                        st.success(f"✅ Processed {len(attachments_sources)} attachments")
+
+                except Exception as e:
+                    st.error(f"❌ Failed to process attachments: {e}")
+                    attachments_index = None
+
+            # ----- Build a small OCR/text snippet so the LLM can use attachments -----
+            attachment_snippet = _synthesize_attachment_snippet(st.session_state.get("attachments_sources", []))
+            query_for_agent = f"{query}\n\n[Attachment snippet]\n{attachment_snippet}" if attachment_snippet else query
 
             # ----- Chat history pairs -----
             chat_history = []
@@ -577,7 +722,7 @@ with col2:
                     user_requirements["weights"] = {
                         "valuation": 0.30, "risk": 0.40, "momentum": 0.10, "size": 0.15, "sentiment": 0.05
                     }
-                else:  # Moderate
+                else:
                     user_requirements["weights"] = {
                         "valuation": 0.25, "risk": 0.30, "momentum": 0.20, "size": 0.15, "sentiment": 0.10
                     }
@@ -585,18 +730,49 @@ with col2:
             # ----- Call agent -----
             with st.spinner("🤖 Analyzing with multi-RAG and live data…"):
                 result = run_customer_support(
-                    query=query + appended_text,
+                    query=query_for_agent,
                     user_profile=user_profile,
                     user_requirements=user_requirements,
-                    force_language=lang_map.get(display_language),  # safe mapping
+                    force_language=lang_map.get("Auto (detect)"),
                     chat_history=chat_history,
-                    file_path=file_path,
+                    file_path=None,  # not used now that we rely on attachments
                     user_id=st.session_state.user_id,
+                    attachments_index=st.session_state.get("attachments_index", attachments_index),
+                    attachments_sources=st.session_state.get("attachments_sources", attachments_sources),
+                    routing_override=st.session_state.get("llm_routing"),
+                    high_fidelity=st.session_state.get("high_fidelity", False),
                 )
 
-            # >>> Only change: normalize + enrich the agent text (handles the “Market Analysis” format)
             _enriched = _enrich_recommendations(result.get("response", ""))
             st.session_state.messages.append({"role": "agent", "content": _enriched})
+            if result.get("charts"):
+                st.markdown("### 📊 Charts")
+                for symbol in result["charts"]:
+                    try:
+                        charts = create_all_charts(symbol)
+                        if charts:
+                            st.markdown(f"#### {symbol} Analysis")
+                            for chart_type, fig in charts.items():
+                                if fig:
+                                    st.plotly_chart(fig, use_container_width=True)
+                    except Exception as e:
+                        st.error(f"Failed to render charts for {symbol}: {e}")
+
+            if result.get("explainability"):
+                with st.expander("🔍 Analysis Details"):
+                    explainability = result["explainability"]
+                    if explainability.get("llm_providers"):
+                        st.write("**LLM Providers:**", explainability["llm_providers"])
+                    if explainability.get("routing_mode"):
+                        st.write("**Routing Mode:**", explainability["routing_mode"])
+                    if explainability.get("consensus_judge"):
+                        st.write("**Consensus Judge:**", explainability["consensus_judge"])
+                    if explainability.get("attachment_sources"):
+                        st.write(f"**Attachment Sources:** {explainability['attachment_sources']} documents")
+                    if explainability.get("filings"):
+                        st.write("**SEC Filings:**")
+                        for filing in explainability["filings"][:3]:
+                            st.write(f"- {filing.get('form', 'N/A')} ({filing.get('filing_date', 'N/A')})")
 
             st.session_state.clear_query = True
             st.rerun()
@@ -607,7 +783,7 @@ if st.session_state.messages and st.session_state.messages[-1]["role"] == "agent
     st.download_button(
         "⬇️ Download last answer (Markdown)",
         data=md_text.encode("utf-8"),
-        file_name=f"recommendations_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.md",
+        file_name=f"recommendations_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.md",
         mime="text/markdown",
         use_container_width=True,
     )

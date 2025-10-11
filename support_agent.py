@@ -28,7 +28,8 @@ except Exception:
     pipeline = None  # translation optional
 
 # Search
-from duckduckgo_search import DDGS
+from ddgs import DDGS
+
 
 # Validation & parsing
 from pydantic import BaseModel, Field, ValidationError
@@ -42,6 +43,27 @@ from rag_numeric import ingest_numeric_for_symbols, numeric_retrieve
 
 # Sentiment (FinBERT primary, VADER fallback handled in sentiment backend)
 from sentiment_backend import sent_score as _sent_score
+
+# New services for real-data finance agent
+from services.llm import chat, chat_once, chat_consensus
+from services.provider_router import get_active_provider, healthcheck, routing_mode, should_use_consensus, get_consensus_voters, get_consensus_judge
+from services.market_data import get_history, get_last_price, get_quote, get_multiple_quotes, validate_symbol, get_market_status, calculate_technical_indicators
+from services.edgar import latest_filings_for_ticker, get_company_facts_for_ticker, search_filings, get_filing_document
+# works whether `attachments.py` is at project root or inside `services/`
+try:
+    from services.attachments import (
+        AttachmentIndex,
+        process_attachment_file,
+        process_attachment_files,
+    )
+except ModuleNotFoundError:
+    from attachments import (
+        AttachmentIndex,
+        process_attachment_file,
+        process_attachment_files,
+    )
+
+
 
 load_dotenv()
 
@@ -68,6 +90,15 @@ SP500_FULL_CACHE_FILE = "sp500_full_cache.csv"
 
 # ---- Performance budget knob (added) ----
 AGENT_BUDGET_MS = int(os.getenv("AGENT_BUDGET_MS", "1200"))
+
+# Academic preset for conservative analysis
+ACADEMIC_PRESET = {
+    "risk_tolerance": "Conservative",
+    "investment_timeline": "Medium-term",
+    "weights": {"valuation":0.30, "risk":0.35, "momentum":0.15, "size":0.15, "sentiment":0.05},
+    "style": "academic",
+    "require_primary_sources": True,
+}
 
 def _over_budget(state) -> bool:
     """Return True if we've exceeded the overall agent time budget."""
@@ -233,33 +264,41 @@ def llm_call(task: str, messages: List[Dict[str, str]], max_tries: int = 2) -> _
             return _LLMResponse(stub)
         return _LLMResponse("—")
 
-    models = MODEL_CATALOG.get(task, MODEL_CATALOG["default"])
-    last = _LLMResponse("")
-    for m in models[:max_tries]:
-        resp = _ollama_invoke(messages, model=m)
-        txt = resp.content.strip()
-        if task == "sql":
-            if re.search(r"```sql", txt, re.IGNORECASE):
-                return resp
-        else:
-            if len(txt) > 5:
-                return resp
-        last = resp
+    # Use new LLM service with backward compatibility
+    try:
+        content = chat(messages)
+        return _LLMResponse(content)
+    except Exception as e:
+        logger.warning(f"New LLM service failed, falling back to old method: {e}")
+        
+        # Fallback to old method
+        models = MODEL_CATALOG.get(task, MODEL_CATALOG["default"])
+        last = _LLMResponse("")
+        for m in models[:max_tries]:
+            resp = _ollama_invoke(messages, model=m)
+            txt = resp.content.strip()
+            if task == "sql":
+                if re.search(r"```sql", txt, re.IGNORECASE):
+                    return resp
+            else:
+                if len(txt) > 5:
+                    return resp
+            last = resp
 
-    if task == "sql":
-        stub = (
-            "```sql\n"
-            "SELECT symbol, name, sector, market_cap, pe_ratio, price, risk_level, beta "
-            "FROM companies ORDER BY market_cap DESC LIMIT 20;\n"
-            "```\n"
-            "```sql\n"
-            "SELECT symbol, name, sector, pe_ratio, beta FROM companies "
-            "WHERE pe_ratio > 0 AND pe_ratio < 25 AND beta < 1.3 "
-            "ORDER BY pe_ratio ASC LIMIT 20;\n"
-            "```\n"
-        )
-        return _LLMResponse(stub)
-    return _LLMResponse("—")
+        if task == "sql":
+            stub = (
+                "```sql\n"
+                "SELECT symbol, name, sector, market_cap, pe_ratio, price, risk_level, beta "
+                "FROM companies ORDER BY market_cap DESC LIMIT 20;\n"
+                "```\n"
+                "```sql\n"
+                "SELECT symbol, name, sector, pe_ratio, beta FROM companies "
+                "WHERE pe_ratio > 0 AND pe_ratio < 25 AND beta < 1.3 "
+                "ORDER BY pe_ratio ASC LIMIT 20;\n"
+                "```\n"
+            )
+            return _LLMResponse(stub)
+        return _LLMResponse("—")
 
 # ======================================================================
 # =================== PRICE HISTORY (YF → STOOQ → SYNTHETIC) ===========
@@ -1143,7 +1182,7 @@ def validate_recommendations(items: List[dict]) -> List[dict]:
     for it in items:
         try:
             v = Recommendation(**it)
-            out.append(v.dict())
+            out.append(v.model_dump())
         except ValidationError:
             continue
     return out
@@ -1301,7 +1340,7 @@ def format_portfolio_response(perf: dict) -> str:
 
 def validate_query(query: str) -> str:
     if not query or len(query.strip()) == 0: raise ValueError("Query cannot be empty")
-    if len(query) > 2000: raise ValueError("Query too long (max 2000 characters)")
+    if len(query) > 20000: raise ValueError("Query too long (max 20000 characters)")
     q = query.strip()
     q = re.sub(r"<[^>]+>", "", q)
     q = re.sub(r"javascript:", "", q, flags=re.IGNORECASE)
@@ -1354,6 +1393,10 @@ def run_customer_support(
     chat_history: Optional[List[Dict[str, str]]] = None,
     file_path: Optional[str] = None,
     user_id: str = "anonymous_user",
+    attachments_index: Optional[AttachmentIndex] = None,
+    attachments_sources: Optional[List] = None,
+    routing_override: Optional[str] = None,
+    high_fidelity: bool = False,
 ) -> Dict[str, Any]:
     if chat_history is None: chat_history = []
     if user_profile is None: user_profile = {}
@@ -1375,6 +1418,61 @@ def run_customer_support(
         translated_query, detected_lang = translate_input_to_english(query)
     context = conversation_memory.get_context_summary(user_id)
     intent = detect_intent(translated_query)
+    
+    # Initialize result dict with new fields
+    result = {
+        "original_language": "English",
+        "response": "",
+        "raw_response": "",
+        "remaining_requests": remaining,
+        "charts": [],
+        "explainability": {}
+    }
+    
+    # Check for chart requests
+    chart_keywords = ["chart", "plot", "rsi", "drawdown", "macd", "technical analysis"]
+    if any(kw in translated_query.lower() for kw in chart_keywords):
+        # Extract ticker symbols from query
+        ticker_pattern = r'\b([A-Z]{1,5})\b'
+        tickers = re.findall(ticker_pattern, translated_query.upper())
+        if tickers:
+            result["charts"] = tickers[:3]  # Limit to 3 symbols
+    
+    # Check for filing requests
+    filing_keywords = ["10-k", "10-q", "8-k", "filing", "sec", "edgar"]
+    if any(kw in translated_query.lower() for kw in filing_keywords):
+        ticker_pattern = r'\b([A-Z]{1,5})\b'
+        tickers = re.findall(ticker_pattern, translated_query.upper())
+        if tickers:
+            # Get filings for the first ticker found
+            filings = latest_filings_for_ticker(tickers[0], limit=5)
+            if filings:
+                result["explainability"]["filings"] = filings
+    # ---- Attachment intent override (vision-first) ----
+    attachment_context = ""
+    has_attachments = bool(attachments_index and getattr(attachments_index, "is_built", False))
+    IMAGE_WORDS = ("image","photo","picture","screenshot","diagram","chart","scan","slide","attachment","file","document")
+
+    logger.info(f"[routing] intent(before)={intent} has_attachments={has_attachments}")
+
+    if has_attachments:
+        try:
+            # If the user mentions an image/file, force general (vision) intent
+            if any(w in translated_query.lower() for w in IMAGE_WORDS):
+                intent = "general_query"
+            # Always pull attachment text so we can include it later
+            q_for_attach = translated_query.strip() or "describe the image"
+            attachment_hits = attachments_index.query(q_for_attach, k=5)
+            if attachment_hits:
+                attachment_context = "\n\nAttachment Context:\n" + "\n".join(
+                    [f"- {t[:500]}..." for t, _ in attachment_hits]
+                )
+                result["explainability"]["attachment_sources"] = len(attachment_hits)
+        except Exception as e:
+            logger.warning(f"Attachment query failed: {e}")
+
+    logger.info(f"[routing] intent(after)={intent} attach_ctx_len={len(attachment_context)}")
+
 
     if intent == "add_to_portfolio":
         m = re.search(r"buy\s+([\d.,]+)\s+shares?\s+of\s+([A-Za-z.\-]{1,7})", translated_query, re.IGNORECASE)
@@ -1397,9 +1495,36 @@ def run_customer_support(
         response = format_portfolio_response(performance_data)
 
     elif intent == "financial_analysis":
+        # Check for attachment context  🔁 REPLACE THIS WHOLE BLOCK
+        attachment_context = ""
+        has_attachments = bool(attachments_index and getattr(attachments_index, "is_built", False))
+        image_words = ("image","photo","picture","screenshot","diagram","chart","attachment","file","document")
+        if has_attachments:
+            try:
+                if any(w in translated_query.lower() for w in image_words):
+                    intent = "general_query"
+                    
+                q_for_attach = translated_query.strip() or "describe the image"
+                attachment_results = attachments_index.query(q_for_attach, k=5)
+                if attachment_results:
+                    attachment_context = "\n\nAttachment Context:\n" + "\n".join(
+                        [f"- {text[:400]}..." for text, score in attachment_results]
+                    )
+                    result["explainability"]["attachment_sources"] = len(attachment_results)
+            except Exception as e:
+                logger.warning(f"Attachment query failed: {e}")
+
+        
+        # Determine LLM routing mode
+        mode = routing_override or routing_mode()
+        use_consensus = should_use_consensus(high_fidelity)
+        
+        # Enhanced query with attachment context
+        enhanced_query = translated_query + attachment_context
+        
         workflow = create_financial_workflow()
         initial_state: FinancialAgentState = {
-            "query": translated_query,
+            "query": enhanced_query,
             "user_profile": user_profile,
             "user_requirements": user_requirements,
             "decomposed": {},
@@ -1408,11 +1533,32 @@ def run_customer_support(
             "budget_t0": time.time(),  # start overall budget timer (added)
         }
         try:
-            result = workflow.invoke(initial_state)
-            response = result.get("final_response", "Analysis complete, but no response was generated.")
+            workflow_result = workflow.invoke(initial_state)
+            base_response = workflow_result.get("final_response", "Analysis complete, but no response was generated.")
+            
+            # Apply LLM routing if needed
+            if use_consensus and mode == "consensus":
+                try:
+                    consensus_result = chat_consensus(
+                        [{"role": "user", "content": f"Provide a comprehensive financial analysis for: {enhanced_query}"}],
+                        voters=get_consensus_voters(),
+                        judge=get_consensus_judge()
+                    )
+                    if consensus_result.get("final"):
+                        response = consensus_result["final"]
+                        result["explainability"]["consensus_judge"] = consensus_result.get("judge", "")
+                        result["explainability"]["consensus_candidates"] = len(consensus_result.get("candidates", []))
+                    else:
+                        response = base_response
+                except Exception as e:
+                    logger.warning(f"Consensus mode failed: {e}")
+                    response = base_response
+            else:
+                response = base_response
+                
         except Exception as e:
             logger.error(f"Financial workflow failed: {e}")
-            response = "Sorry, the      financial analysis system is temporarily unavailable. Please try again later."
+            response = "Sorry, the financial analysis system is temporarily unavailable. Please try again later."
     else:
         response = handle_general_query_with_search(translated_query, context, chat_history, file_path)
 
@@ -1420,5 +1566,16 @@ def run_customer_support(
     target_lang = force_language if force_language else detected_lang
     translated_response = translate_output_from_english(response, target_lang)
 
-    return {"original_language": SUPPORTED_LANGUAGES.get(detected_lang, detected_lang),
-            "response": translated_response, "raw_response": response, "remaining_requests": remaining}
+    # Update result with final values
+    result["original_language"] = SUPPORTED_LANGUAGES.get(detected_lang, detected_lang)
+    result["response"] = translated_response
+    result["raw_response"] = response
+    result["remaining_requests"] = remaining
+    
+    # Add LLM provider status to explainability
+    provider_status = healthcheck()
+    result["explainability"]["llm_providers"] = provider_status
+    result["explainability"]["routing_mode"] = routing_override or routing_mode()
+    result["explainability"]["high_fidelity"] = high_fidelity
+
+    return result
