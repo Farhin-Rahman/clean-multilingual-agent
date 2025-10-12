@@ -1,122 +1,70 @@
-# services/ocr.py - OCR text extraction from images
-
-import os
-import logging
+# services/ocr.py
+from __future__ import annotations
+import os, io, logging, shutil, requests
 from typing import Optional
-import requests
+from PIL import Image  # pillow is already in requirements
+import streamlit as st
 
 logger = logging.getLogger(__name__)
-import os
-import logging
-from dotenv import load_dotenv
 
-load_dotenv()  # load .env from project root
-
-logger = logging.getLogger("services.ocr")
-
-try:
-    import pytesseract
-    # 1) Use env var if present
+def _get_tesseract_cmd() -> Optional[str]:
+    # Respect explicit override, then PATH
     cmd = os.getenv("TESSERACT_CMD")
     if cmd and os.path.exists(cmd):
-        pytesseract.pytesseract.tesseract_cmd = cmd
-        logger.info(f"Using Tesseract at: {cmd}")
-    else:
-        # 2) Try to find it on PATH or common Windows locations
-        from shutil import which
-        found = which("tesseract")
-        if found:
-            pytesseract.pytesseract.tesseract_cmd = found
-            logger.info(f"Using Tesseract (PATH): {found}")
-        else:
-            for candidate in (
-                r"C:\Program Files\Tesseract-OCR\tesseract.exe",
-                r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
-            ):
-                if os.path.exists(candidate):
-                    pytesseract.pytesseract.tesseract_cmd = candidate
-                    logger.info(f"Using Tesseract (fallback): {candidate}")
-                    break
-except Exception:
-    pytesseract = None
+        return cmd
+    return shutil.which("tesseract")
 
+def ocr_image(path: str) -> str:
+    """
+    Returns extracted text from an image file.
+    Strategy:
+      1) pytesseract if a tesseract binary is available.
+      2) OCR.Space API if configured.
+      3) else return "" (and caller will handle gracefully).
+    """
+    text = ""
+    try:
+        tess = _get_tesseract_cmd()
+        if tess:
+            import pytesseract
+            pytesseract.pytesseract.tesseract_cmd = tess
+            text = pytesseract.image_to_string(Image.open(path)) or ""
+            if text.strip():
+                logger.info("OCR via pytesseract succeeded")
+                return text
+            logger.warning("pytesseract returned empty text; will try OCR.Space if available.")
+    except Exception as e:
+        logger.warning("pytesseract path/method unavailable: %s", e)
 
-def extract_text_from_image(path: str, lang: str = "eng") -> str:
-    """
-    Extract text from an image using OCR.
-    
-    Args:
-        path: Path to the image file
-        lang: Language code for OCR (default: 'eng')
-    
-    Returns:
-        Extracted text or empty string if failed
-    """
-    if not os.path.exists(path):
-        logger.warning(f"Image file not found: {path}")
-        return ""
-    
-    # Try pytesseract first
-    try:
-        import pytesseract
-        from PIL import Image
-        
-        image = Image.open(path)
-        text = pytesseract.image_to_string(image, lang=lang)
-        
-        if text.strip():
-            logger.info(f"OCR successful with pytesseract for {path}")
-            return text.strip()
-        
-    except ImportError:
-        logger.info("pytesseract not available, trying OCR.space")
-    except Exception as e:
-        logger.warning(f"pytesseract failed for {path}: {e}")
-    
-    # Fallback to OCR.space API
-    try:
-        api_key = os.getenv("OCR_SPACE_API_KEY")
-        if not api_key:
-            logger.warning("OCR_SPACE_API_KEY not configured")
-            return ""
-        
-        with open(path, 'rb') as image_file:
-            files = {'file': image_file}
-            data = {
-                'apikey': api_key,
-                'language': lang,
-                'isOverlayRequired': False,
-                'OCREngine': 2  # Use OCR Engine 2 for better accuracy
-            }
-            
-            response = requests.post(
-                'https://api.ocr.space/parse/image',
-                files=files,
-                data=data,
-                timeout=30
-            )
-            
-            if response.status_code == 200:
-                result = response.json()
-                
-                if result.get('IsErroredOnProcessing', False):
-                    logger.warning(f"OCR.space processing error: {result.get('ErrorMessage', 'Unknown error')}")
-                    return ""
-                
-                parsed_results = result.get('ParsedResults', [])
-                if parsed_results:
-                    text = parsed_results[0].get('ParsedText', '')
-                    if text.strip():
-                        logger.info(f"OCR successful with OCR.space for {path}")
-                        return text.strip()
-            
-            logger.warning(f"OCR.space API returned status {response.status_code}")
-            
-    except Exception as e:
-        logger.warning(f"OCR.space failed for {path}: {e}")
-    
-    logger.warning(f"All OCR methods failed for {path}")
+    # --- Fallback: OCR.Space ---
+    key = (st.secrets.get("OCR_SPACE_API_KEY")
+           if hasattr(st, "secrets") else None) or os.getenv("OCR_SPACE_API_KEY")
+    if key:
+        try:
+            with open(path, "rb") as f:
+                resp = requests.post(
+                    "https://api.ocr.space/parse/image",
+                    data={"apikey": key, "OCREngine": 2, "scale": True, "language": "eng"},
+                    files={"file": (os.path.basename(path), f)},
+                    timeout=60,
+                )
+            resp.raise_for_status()
+            data = resp.json()
+            parsed = data.get("ParsedResults", [{}])[0].get("ParsedText", "")
+            if parsed and parsed.strip():
+                logger.info("OCR via OCR.Space succeeded")
+                return parsed
+            logger.warning("OCR.Space returned no text.")
+        except Exception as e:
+            logger.warning("OCR.Space failed: %s", e)
+
+    logger.warning("No OCR available; returning empty text.")
     return ""
+
+# Legacy function names for backward compatibility
+def extract_text_from_image(path: str, lang: str = "eng") -> str:
+    """Legacy function name - calls ocr_image."""
+    return ocr_image(path)
 
 def extract_text_from_image_bytes(image_bytes: bytes, lang: str = "eng") -> str:
     """
@@ -131,7 +79,6 @@ def extract_text_from_image_bytes(image_bytes: bytes, lang: str = "eng") -> str:
     """
     try:
         import tempfile
-        from PIL import Image
         
         # Save bytes to temporary file
         with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp_file:
@@ -139,7 +86,7 @@ def extract_text_from_image_bytes(image_bytes: bytes, lang: str = "eng") -> str:
             tmp_path = tmp_file.name
         
         try:
-            text = extract_text_from_image(tmp_path, lang)
+            text = ocr_image(tmp_path)
             return text
         finally:
             # Clean up temporary file

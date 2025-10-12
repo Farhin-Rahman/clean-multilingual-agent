@@ -24,6 +24,9 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+ROOT = Path(__file__).parent
+SAMPLE_IMAGE = ROOT / "uploads" / "images" / "analysis-of-financial-statements-3-1002x1024.png"
+
 import streamlit as st
 
 from support_agent import run_customer_support, is_financial_query
@@ -662,26 +665,40 @@ with col2:
             attachments_index = st.session_state.get("attachments_index")
             attachments_sources = st.session_state.get("attachments_sources", [])
 
-            # Process current uploads (images/docs)
-            if uploaded_images or uploaded_docs:
+            # Process uploads and create cloud-safe file list
+            files = []
+            
+            # Handle uploaded files
+            for uf in (uploaded_images or []):
+                suffix = Path(uf.name).suffix
+                tmp_path = Path(tempfile.gettempdir()) / f"st_{uuid.uuid4().hex}{suffix}"
+                with open(tmp_path, "wb") as f:
+                    f.write(uf.getbuffer())
+                files.append((str(tmp_path), uf.type))
+            
+            for uf in (uploaded_docs or []):
+                suffix = Path(uf.name).suffix
+                tmp_path = Path(tempfile.gettempdir()) / f"st_{uuid.uuid4().hex}{suffix}"
+                with open(tmp_path, "wb") as f:
+                    f.write(uf.getbuffer())
+                files.append((str(tmp_path), uf.type))
+
+            # Fallback: if nothing uploaded, use the bundled sample (if it exists)
+            if not files and SAMPLE_IMAGE.exists():
+                files = [(str(SAMPLE_IMAGE), "image/png")]
+
+            # Process files
+            if files:
                 try:
                     attachments_index = AttachmentIndex()
-                    images_dir = UPLOAD_DIR / "images"; images_dir.mkdir(exist_ok=True)
-                    docs_dir = UPLOAD_DIR / "docs"; docs_dir.mkdir(exist_ok=True)
-
-                    for img_file in (uploaded_images or []):
-                        safe = "".join(c for c in img_file.name if c.isalnum() or c in ("-", "_", "."))
-                        save_path = images_dir / safe
-                        with save_path.open("wb") as f: f.write(img_file.read())
-                        if process_attachment_file(str(save_path), attachments_index):
-                            attachments_sources.append({"type": "image", "name": img_file.name, "path": str(save_path)})
-
-                    for doc_file in (uploaded_docs or []):
-                        safe = "".join(c for c in doc_file.name if c.isalnum() or c in ("-", "_", "."))
-                        save_path = docs_dir / safe
-                        with save_path.open("wb") as f: f.write(doc_file.read())
-                        if process_attachment_file(str(save_path), attachments_index):
-                            attachments_sources.append({"type": "document", "name": doc_file.name, "path": str(save_path)})
+                    
+                    for file_path, file_type in files:
+                        if process_attachment_file(file_path, attachments_index):
+                            attachments_sources.append({
+                                "type": "image" if file_type.startswith("image/") else "document", 
+                                "name": Path(file_path).name, 
+                                "path": file_path
+                            })
 
                     if getattr(attachments_index, "texts", None):
                         attachments_index.build()
@@ -695,6 +712,13 @@ with col2:
 
             # ----- Build a small OCR/text snippet so the LLM can use attachments -----
             attachment_snippet = _synthesize_attachment_snippet(st.session_state.get("attachments_sources", []))
+            
+            # Provide clearer user feedback
+            if not files:
+                st.info("No files received. Upload an image/PDF (left sidebar) or I'll use the sample chart.")
+            elif not attachment_snippet.strip():
+                st.warning("I couldn't read text from your file. If this is an image with text, enable OCR fallback by adding `OCR_SPACE_API_KEY` in your Streamlit secrets, or upload a clearer image.")
+            
             query_for_agent = f"{query}\n\n[Attachment snippet]\n{attachment_snippet}" if attachment_snippet else query
 
             # ----- Chat history pairs -----
