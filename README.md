@@ -10,7 +10,7 @@
   <img alt="Python" src="https://img.shields.io/badge/python-3.11%2B-informational" />
 </p>
 
-> **What it shows:** A production-style *agentic* system that **finds information** (A1), **integrates sources** (A2), **turns text to SQL** (A3), and **recommends options under user-weighted criteria** (A4). It blends ML with **neuro-symbolic** rules and hard **guardrails** to reduce hallucinations — a strong fit for Kodamai’s JD & assignment.
+> **What it shows:** A production-style *agentic* system that **finds information** (A1), **integrates sources** (A2), **turns text to SQL** (A3), and **recommends options under user-weighted criteria** (A4). It blends ML with **neuro-symbolic** rules and hard **guardrails** to reduce hallucinations — a strong fit for Kodamai's JD & assignment.
 
 ---
 
@@ -27,7 +27,7 @@
 
 ---
 
-## 🧭 Architecture (bird’s-eye)
+## 🧭 Architecture (bird's-eye)
 
 User ↔ Streamlit UI
 │
@@ -69,9 +69,23 @@ pip install -r requirements.txt
 # Optional (local LLM):
 # ollama pull llama3.1:8b-instruct
 streamlit run app.py
+```
+
+### Linux/macOS
+```bash
 python -m venv venv && source venv/bin/activate
 python -m pip install -U pip
 pip install -r requirements.txt
 # Optional (local LLM):
 # ollama pull llama3.1:8b-instruct
 streamlit run app.py
+```
+
+## 🚀 Deploy Notes
+
+### Streamlit Cloud
+- Streamlit Cloud ignores `.env` files; set secrets in the dashboard:
+  - `GROQ_API_KEY` = your Groq API key
+  - `SEC_USER_AGENT` = "Your Name your@email"
+- OCR will gracefully skip if Tesseract is missing
+- DuckDuckGo search will fallback gracefully if unavailable

@@ -27,8 +27,17 @@ try:
 except Exception:
     pipeline = None  # translation optional
 
-# Search
-from ddgs import DDGS
+# --- DuckDuckGo search client import (robust) ---
+try:
+    from ddgs import DDGS  # preferred new package
+    _DDG_BACKEND = "ddgs"
+except Exception:  # pragma: no cover
+    try:
+        from duckduckgo_search import DDGS  # legacy name
+        _DDG_BACKEND = "duckduckgo_search"
+    except Exception:  # pragma: no cover
+        DDGS = None
+        _DDG_BACKEND = None
 
 
 # Validation & parsing
@@ -68,9 +77,14 @@ except ModuleNotFoundError:
 load_dotenv()
 
 # --------------------------- Logging & knobs ------------------------------
-LOGLEVEL = (os.getenv("LOGLEVEL") or "INFO").upper()
-logging.basicConfig(level=getattr(logging, LOGLEVEL, logging.INFO))
+LOGLEVEL = (os.getenv("LOGLEVEL") or "WARNING").upper()
+logging.basicConfig(level=getattr(logging, LOGLEVEL, logging.WARNING))
 logger = logging.getLogger("support_agent")
+
+if _DDG_BACKEND:
+    logger.info("Using DuckDuckGo client: %s", _DDG_BACKEND)
+else:
+    logger.warning("DuckDuckGo client not available; news/search will skip DDG.")
 
 # Optional HTTP cache (global install)
 try:
@@ -384,11 +398,29 @@ def _compute_beta(sym_close: pd.Series, mkt_close: pd.Series) -> float:
     except Exception:
         return 1.0
 
-# ---------- DDG with retry (added) ----------
+# ---------- DDG helper functions (robust) ----------
+def ddg_news_search(query: str, max_results: int = 20):
+    """Robust DuckDuckGo news search with fallback."""
+    if DDGS is None:
+        return []
+    try:
+        with DDGS() as ddgs:
+            return list(ddgs.news(query, max_results=max_results))
+    except Exception as e:
+        logger.warning("DDG search failed: %s", e)
+        return []
+
 @retry(wait=wait_exponential(min=0.2, max=2.0), stop=stop_after_attempt(3))
 def _safe_ddg_text(query: str, max_results: int = 5):
-    with DDGS() as ddgs:
-        return list(ddgs.text(query, max_results=max_results))
+    """Legacy DDG text search - now uses robust helper."""
+    if DDGS is None:
+        return []
+    try:
+        with DDGS() as ddgs:
+            return list(ddgs.text(query, max_results=max_results))
+    except Exception as e:
+        logger.warning("DDG text search failed: %s", e)
+        return []
 
 def _headlines_for_symbol(sym: str, max_n: int = 6) -> List[dict]:
     """Use DuckDuckGo (shimmed in demo) for headlines."""
