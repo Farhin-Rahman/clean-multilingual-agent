@@ -81,11 +81,23 @@ if HIDE_SIDEBAR:
 
 
 # ===================== Enrichment / Normalizer ======================
+def _fmt_dy(dy):
+    if not isinstance(dy, (int, float)) or dy <= 0:
+        return "—"
+    pct = dy*100 if dy < 1 else dy  # allow 0.017 or 1.7 to render as 1.7%
+    pct = max(0.0, min(pct, 20.0))  # clamp to 20% to avoid absurd values
+    return f"{pct:.1f}%"
+
 def _enrich_recommendations(markdown_text: str) -> str:
     import re
     import numpy as np
     import pandas as pd
     import yfinance as yf  # shimmed by sitecustomize when FREE_DEMO=1
+
+    # Fast exit: if academic sections or header already present, don't add another header
+    if "Assumptions" in markdown_text or "Limitations" in markdown_text or "### Safe stock suggestions" in markdown_text:
+        cleaned = "\n".join([ln for ln in markdown_text.splitlines() if not ln.strip().startswith("Note:")])
+        return cleaned
 
     risk_label = st.session_state.get("risk_tolerance", "Moderate")
 
@@ -182,7 +194,7 @@ def _enrich_recommendations(markdown_text: str) -> str:
             if isinstance(beta, (int, float)):
                 prof.append(f"β≈{beta:.2f}")
             if isinstance(dy, (int, float)) and dy > 0:
-                prof.append(f"DY≈{dy*100:.1f}%")
+                prof.append(f"DY≈{_fmt_dy(dy)}")
             if prof:
                 bullets.append("Profile: " + " • ".join(prof))
 
@@ -294,7 +306,7 @@ def _enrich_recommendations(markdown_text: str) -> str:
             prof = []
             if sector: prof.append(sector + (f" — {industry}" if industry else ""))
             if isinstance(beta, (int, float)): prof.append(f"β≈{beta:.2f}")
-            if isinstance(dy, (int, float)) and dy > 0: prof.append(f"DY≈{dy*100:.1f}%")
+            if isinstance(dy, (int, float)) and dy > 0: prof.append(f"DY≈{_fmt_dy(dy)}")
             if prof: bullets.append("Profile: " + " • ".join(prof))
             val = []
             if isinstance(pe, (int, float)): val.append(f"P/E≈{pe:.1f}x")
@@ -326,21 +338,40 @@ st.markdown(
 /* Hide menu/deploy/footer ONLY — keep header & sidebar visible */
 #MainMenu, .stDeployButton, footer { visibility: hidden; }
 
-/* Force the sidebar to be visible and expanded */
-section[data-testid="stSidebar"]{
-  visibility: visible !important;
-  transform: none !important;            /* overrides collapsed translate */
-  width: 20rem !important;
-  min-width: 20rem !important;
+/* Sidebar: let Streamlit control collapse/expand. Tweak widths only. */
+section[data-testid="stSidebar"] {
+  width: 20rem;
+  min-width: 16rem;
 }
 
-/* Make sure the hamburger/toggle is visible */
-header { visibility: visible !important; }
+/* Make the toggle (hamburger) always clickable/visible */
 header [data-testid="collapsedControl"]{
   visibility: visible !important;
   opacity: 1 !important;
   pointer-events: auto !important;
 }
+
+/* Mobile: sidebar uses full width; main gets comfortable padding */
+@media (max-width: 768px){
+  section[data-testid="stSidebar"]{
+    width: 100vw !important;
+    min-width: 0 !important;
+  }
+  .main .block-container{
+    padding-left: 0.75rem !important;
+    padding-right: 0.75rem !important;
+  }
+  .user-message { margin-left: 0; }
+  .assistant-message { margin-right: 0; }
+}
+
+/* Readability inside assistant bubbles */
+.assistant-message h3, .assistant-message h4 { margin: 1rem 0 .5rem; line-height: 1.25; }
+.assistant-message p { margin: .4rem 0 .8rem; }
+.assistant-message ul, .assistant-message ol { margin: .25rem 0 .9rem 1.1rem; }
+.assistant-message li { margin: .25rem 0; }
+.assistant-message a { word-break: break-all; }
+.assistant-message code { white-space: pre-wrap; word-break: break-word; }
 
 .main { background: radial-gradient(circle at 20% 20%, rgba(200,180,255,.1), transparent 30%),
                     radial-gradient(circle at 80% 80%, rgba(180,220,255,.1), transparent 30%), #FFFFFF;
@@ -466,6 +497,13 @@ if "clear_query" not in st.session_state:
 if "user_id" not in st.session_state:
     st.session_state.user_id = "user_" + hashlib.sha256(str(uuid.uuid4()).encode()).hexdigest()[:12]
 
+if "use_attachments_next" not in st.session_state:
+    st.session_state.use_attachments_next = False
+
+# NEW: persist last charts/symbols that should render on every rerun
+if "last_charts" not in st.session_state:
+    st.session_state.last_charts = []
+
 if st.session_state.clear_query:
     st.session_state.query = ""
     st.session_state.clear_query = False
@@ -499,6 +537,15 @@ with st.sidebar:
         with st.expander("Processed attachments", expanded=True):
             for s in st.session_state["attachments_sources"]:
                 st.write(f"- {s['type']}: **{os.path.basename(s['path'])}**")
+
+    # One-shot attachment usage toggle (default OFF)
+    if st.session_state.get("attachments_sources"):
+        st.checkbox(
+            "📎 Use attachments for next question only",
+            key="use_attachments_next",
+            value=False,
+            help="When ON, the next message will include any processed files. Then it turns OFF automatically."
+        )
 
     st.markdown("### 📊 Financial Analysis Settings")
     st.session_state.is_financial_mode = st.checkbox(
@@ -570,6 +617,7 @@ with st.sidebar:
     except Exception:
         st.markdown("**LLM Status:** Unable to check provider status")
 
+    # --- Language selection ---
     lang_map = {
         "Auto (detect)": None,
         "English": "en",
@@ -581,8 +629,18 @@ with st.sidebar:
         "Portuguese": "pt",
     }
 
+    # 🌐 Language
+    lang_choice = st.selectbox(
+        "🌐 Language",
+        list(lang_map.keys()),
+        index=0,
+        help="Choose the language for the assistant's reply. 'Auto (detect)' replies in your input language."
+    )
+    st.session_state["ui_language"] = lang_map.get(lang_choice)
+
     if st.button("🔄 Start New Conversation"):
         st.session_state.clear()
+        st.session_state.last_charts = []
         st.rerun()
 
 
@@ -629,6 +687,20 @@ with chat_container:
             if html_audio:
                 st.markdown(html_audio, unsafe_allow_html=True)
 
+# ========================= Results (Charts) =========================
+if st.session_state.get("last_charts"):
+    st.markdown("### 📊 Charts")
+    for symbol in st.session_state["last_charts"]:
+        try:
+            charts = create_all_charts(symbol)
+            if charts:
+                st.markdown(f"#### {symbol} Analysis")
+                for chart_type, fig in charts.items():
+                    if fig:
+                        st.plotly_chart(fig, use_container_width=True)
+        except Exception as e:
+            st.error(f"Failed to render charts for {symbol}: {e}")
+
 # ========================= Voice Input ========================
 st.markdown("### 🎙️ Voice Input")
 if MIC_AVAILABLE:
@@ -661,65 +733,78 @@ with col2:
         if query.strip():
             st.session_state.messages.append({"role": "user", "content": query})
 
-            # ----- Attachment processing -----
-            attachments_index = st.session_state.get("attachments_index")
+            # ----- Decide if we use attachments for this message -----
+            IMAGE_WORDS = ("image","photo","picture","screenshot","diagram","chart","scan","slide","attachment","file","document","pdf")
+            mentions_attachment = any(w in query.lower() for w in IMAGE_WORDS)
+            use_attachments_now = bool(st.session_state.get("use_attachments_next", False)) or mentions_attachment
+
+            # ----- Attachment processing (only if opted-in) -----
+            attachments_index = None
             attachments_sources = st.session_state.get("attachments_sources", [])
 
-            # Process uploads and create cloud-safe file list
-            files = []
+            if use_attachments_now:
+                # Process uploads and create cloud-safe file list
+                files = []
+                
+                # Handle uploaded files
+                for uf in (uploaded_images or []):
+                    suffix = Path(uf.name).suffix
+                    tmp_path = Path(tempfile.gettempdir()) / f"st_{uuid.uuid4().hex}{suffix}"
+                    with open(tmp_path, "wb") as f:
+                        f.write(uf.getbuffer())
+                    files.append((str(tmp_path), uf.type))
+                
+                for uf in (uploaded_docs or []):
+                    suffix = Path(uf.name).suffix
+                    tmp_path = Path(tempfile.gettempdir()) / f"st_{uuid.uuid4().hex}{suffix}"
+                    with open(tmp_path, "wb") as f:
+                        f.write(uf.getbuffer())
+                    files.append((str(tmp_path), uf.type))
+
+                # Fallback: if nothing uploaded, use the bundled sample (if it exists)
+                if not files and SAMPLE_IMAGE.exists():
+                    files = [(str(SAMPLE_IMAGE), "image/png")]
+
+                # Process files
+                if files:
+                    try:
+                        attachments_index = AttachmentIndex()
+                        
+                        for file_path, file_type in files:
+                            if process_attachment_file(file_path, attachments_index):
+                                attachments_sources.append({
+                                    "type": "image" if file_type.startswith("image/") else "document", 
+                                    "name": Path(file_path).name, 
+                                    "path": file_path
+                                })
+
+                        if getattr(attachments_index, "texts", None):
+                            attachments_index.build()
+                            st.session_state.attachments_index = attachments_index
+                            st.session_state.attachments_sources = attachments_sources
+                            st.success(f"✅ Processed {len(attachments_sources)} attachments")
+
+                    except Exception as e:
+                        st.error(f"❌ Failed to process attachments: {e}")
+                        attachments_index = None
+
+                # Build snippet ONLY if use_attachments_now
+                attachment_snippet = _synthesize_attachment_snippet(
+                    st.session_state.get("attachments_sources", [])
+                )
+                
+                # Provide clearer user feedback
+                if not files:
+                    st.info("No files received. Upload an image/PDF (left sidebar) or I'll use the sample chart.")
+                elif not attachment_snippet.strip():
+                    st.warning("I couldn't read text from your file. If this is an image with text, enable OCR fallback by adding `OCR_SPACE_API_KEY` in your Streamlit secrets, or upload a clearer image.")
+            else:
+                attachment_snippet = ""
             
-            # Handle uploaded files
-            for uf in (uploaded_images or []):
-                suffix = Path(uf.name).suffix
-                tmp_path = Path(tempfile.gettempdir()) / f"st_{uuid.uuid4().hex}{suffix}"
-                with open(tmp_path, "wb") as f:
-                    f.write(uf.getbuffer())
-                files.append((str(tmp_path), uf.type))
-            
-            for uf in (uploaded_docs or []):
-                suffix = Path(uf.name).suffix
-                tmp_path = Path(tempfile.gettempdir()) / f"st_{uuid.uuid4().hex}{suffix}"
-                with open(tmp_path, "wb") as f:
-                    f.write(uf.getbuffer())
-                files.append((str(tmp_path), uf.type))
-
-            # Fallback: if nothing uploaded, use the bundled sample (if it exists)
-            if not files and SAMPLE_IMAGE.exists():
-                files = [(str(SAMPLE_IMAGE), "image/png")]
-
-            # Process files
-            if files:
-                try:
-                    attachments_index = AttachmentIndex()
-                    
-                    for file_path, file_type in files:
-                        if process_attachment_file(file_path, attachments_index):
-                            attachments_sources.append({
-                                "type": "image" if file_type.startswith("image/") else "document", 
-                                "name": Path(file_path).name, 
-                                "path": file_path
-                            })
-
-                    if getattr(attachments_index, "texts", None):
-                        attachments_index.build()
-                        st.session_state.attachments_index = attachments_index
-                        st.session_state.attachments_sources = attachments_sources
-                        st.success(f"✅ Processed {len(attachments_sources)} attachments")
-
-                except Exception as e:
-                    st.error(f"❌ Failed to process attachments: {e}")
-                    attachments_index = None
-
-            # ----- Build a small OCR/text snippet so the LLM can use attachments -----
-            attachment_snippet = _synthesize_attachment_snippet(st.session_state.get("attachments_sources", []))
-            
-            # Provide clearer user feedback
-            if not files:
-                st.info("No files received. Upload an image/PDF (left sidebar) or I'll use the sample chart.")
-            elif not attachment_snippet.strip():
-                st.warning("I couldn't read text from your file. If this is an image with text, enable OCR fallback by adding `OCR_SPACE_API_KEY` in your Streamlit secrets, or upload a clearer image.")
-            
-            query_for_agent = f"{query}\n\n[Attachment snippet]\n{attachment_snippet}" if attachment_snippet else query
+            query_for_agent = (
+                f"{query}\n\n[Attachment snippet]\n{attachment_snippet}"
+                if attachment_snippet else query
+            )
 
             # ----- Chat history pairs -----
             chat_history = []
@@ -731,56 +816,51 @@ with col2:
 
             # ----- Profile & weights -----
             user_profile = {}
-            user_requirements = {}
+            # start from sidebar preset (if any)
+            user_requirements = dict(st.session_state.get("user_requirements", {}))
+            
             if st.session_state.get("is_financial_mode") and is_financial_query(query):
                 user_profile = {
                     "risk_tolerance": st.session_state.get("risk_tolerance", "Moderate"),
                     "investment_timeline": st.session_state.get("investment_timeline", "Medium-term"),
                 }
+                # compute weights from risk and MERGE into any preset weights instead of replacing
+                derived = {}
                 risk = user_profile["risk_tolerance"]
                 if risk == "Aggressive":
-                    user_requirements["weights"] = {
-                        "valuation": 0.15, "risk": 0.20, "momentum": 0.35, "size": 0.15, "sentiment": 0.15
-                    }
+                    derived = {"valuation":0.15,"risk":0.20,"momentum":0.35,"size":0.15,"sentiment":0.15}
                 elif risk == "Conservative":
-                    user_requirements["weights"] = {
-                        "valuation": 0.30, "risk": 0.40, "momentum": 0.10, "size": 0.15, "sentiment": 0.05
-                    }
+                    derived = {"valuation":0.30,"risk":0.40,"momentum":0.10,"size":0.15,"sentiment":0.05}
                 else:
-                    user_requirements["weights"] = {
-                        "valuation": 0.25, "risk": 0.30, "momentum": 0.20, "size": 0.15, "sentiment": 0.10
-                    }
+                    derived = {"valuation":0.25,"risk":0.30,"momentum":0.20,"size":0.15,"sentiment":0.10}
+                base_w = dict(user_requirements.get("weights", {}))
+                base_w.update(derived)
+                user_requirements["weights"] = base_w
 
             # ----- Call agent -----
+            use_attach = bool(st.session_state.get("use_attachments_next", False))
+            attachments_param = st.session_state.get("attachments_index") if use_attach else None
+            
             with st.spinner("🤖 Analyzing with multi-RAG and live data…"):
                 result = run_customer_support(
                     query=query_for_agent,
                     user_profile=user_profile,
                     user_requirements=user_requirements,
-                    force_language=lang_map.get("Auto (detect)"),
+                    force_language=st.session_state.get("ui_language"),
                     chat_history=chat_history,
                     file_path=None,  # not used now that we rely on attachments
                     user_id=st.session_state.user_id,
-                    attachments_index=st.session_state.get("attachments_index", attachments_index),
-                    attachments_sources=st.session_state.get("attachments_sources", attachments_sources),
+                    attachments_index=attachments_param,
+                    attachments_sources=st.session_state.get("attachments_sources", []),
                     routing_override=st.session_state.get("llm_routing"),
                     high_fidelity=st.session_state.get("high_fidelity", False),
                 )
 
             _enriched = _enrich_recommendations(result.get("response", ""))
             st.session_state.messages.append({"role": "agent", "content": _enriched})
-            if result.get("charts"):
-                st.markdown("### 📊 Charts")
-                for symbol in result["charts"]:
-                    try:
-                        charts = create_all_charts(symbol)
-                        if charts:
-                            st.markdown(f"#### {symbol} Analysis")
-                            for chart_type, fig in charts.items():
-                                if fig:
-                                    st.plotly_chart(fig, use_container_width=True)
-                    except Exception as e:
-                        st.error(f"Failed to render charts for {symbol}: {e}")
+            
+            # NEW: persist chart symbols for rendering outside the click branch
+            st.session_state.last_charts = result.get("charts", []) or []
 
             if result.get("explainability"):
                 with st.expander("🔍 Analysis Details"):
@@ -798,6 +878,8 @@ with col2:
                         for filing in explainability["filings"][:3]:
                             st.write(f"- {filing.get('form', 'N/A')} ({filing.get('filing_date', 'N/A')})")
 
+            # turn off so attachments don't "stick"
+            st.session_state.use_attachments_next = False
             st.session_state.clear_query = True
             st.rerun()
 

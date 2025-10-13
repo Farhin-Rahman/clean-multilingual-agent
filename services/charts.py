@@ -8,6 +8,53 @@ from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
 
+# --- global chart helpers -----------------------------------------------
+
+def _panel_caption(fig, row: int, text: str):
+    """Place a small caption inside the given subplot (top-left of its domain)."""
+    suffix = "" if row == 1 else str(row)
+    fig.add_annotation(
+        text=text,
+        xref=f"x{suffix} domain", yref=f"y{suffix} domain",
+        x=0.01, y=0.98,
+        xanchor="left", yanchor="top",
+        showarrow=False,
+        font=dict(size=12, color="#6b7280"),
+    )
+
+def _finalize_subplots(fig, nrows: int, *, bottom_x_title: str = "Date"):
+    """
+    Apply consistent spacing to stacked charts and ensure only the *bottom* row
+    shows the x-axis title/tick labels. Also add standoff everywhere.
+    """
+    # hide x titles/ticks above the bottom row; link their scales
+    for r in range(1, nrows):
+        fig.update_xaxes(
+            row=r, col=1,
+            title_text=None,
+            showticklabels=False,
+            matches="x",
+            title_standoff=28,
+            ticklabelstandoff=6,
+            automargin=True,
+        )
+    # bottom row: show x title with generous standoff
+    fig.update_xaxes(
+        row=nrows, col=1,
+        title_text=bottom_x_title,
+        title_standoff=32,
+        ticklabelstandoff=6,
+        automargin=True,
+    )
+    # give everyone room on Y as well
+    fig.update_yaxes(automargin=True)
+
+    # roomy margins + unified hover look
+    fig.update_layout(
+        margin=dict(t=60, r=20, b=82, l=60),
+        hovermode="x unified",
+    )
+
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """
     Compute technical indicators for a price DataFrame.
@@ -95,8 +142,7 @@ def candle_with_sma(symbol: str) -> Optional[Any]:
         fig = make_subplots(
             rows=2, cols=1,
             shared_xaxes=True,
-            vertical_spacing=0.1,
-            subplot_titles=(f"{symbol} Price & Moving Averages", "Volume"),
+            vertical_spacing=0.10,
             row_width=[0.7, 0.3]
         )
         
@@ -162,18 +208,26 @@ def candle_with_sma(symbol: str) -> Optional[Any]:
                 row=2, col=1
             )
         
+        # Add panel captions
+        _panel_caption(fig, row=1, text=f"{symbol} Price & Moving Averages")
+        _panel_caption(fig, row=2, text="Volume")
+        
+        # Set y-axis titles
+        fig.update_yaxes(title_text="Price ($)", row=1, col=1)
+        fig.update_yaxes(title_text="Volume", row=2, col=1)
+        
+        # Finalize layout
+        _finalize_subplots(fig, nrows=2, bottom_x_title="Date")
+        
         # Update layout
         fig.update_layout(
             title=f"{symbol} - Price Chart with Moving Averages",
-            xaxis_title="Date",
-            yaxis_title="Price ($)",
             height=600,
             showlegend=True,
-            template="plotly_white"
+            template="plotly_white",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            xaxis_rangeslider_visible=False
         )
-        
-        # Remove range slider
-        fig.update_layout(xaxis_rangeslider_visible=False)
         
         logger.info(f"Created candlestick chart for {symbol}")
         return fig
@@ -212,8 +266,7 @@ def rsi_chart(symbol: str) -> Optional[Any]:
         fig = make_subplots(
             rows=2, cols=1,
             shared_xaxes=True,
-            vertical_spacing=0.1,
-            subplot_titles=(f"{symbol} Price", "RSI (14)"),
+            vertical_spacing=0.10,
             row_width=[0.7, 0.3]
         )
         
@@ -244,18 +297,25 @@ def rsi_chart(symbol: str) -> Optional[Any]:
         fig.add_hline(y=30, line_dash="dash", line_color="green", row=2, col=1)
         fig.add_hline(y=50, line_dash="dot", line_color="gray", row=2, col=1)
         
+        # Add panel captions
+        _panel_caption(fig, row=1, text=f"{symbol} Price")
+        _panel_caption(fig, row=2, text="RSI (14)")
+        
+        # Set y-axis titles and ranges
+        fig.update_yaxes(title_text="Price ($)", row=1, col=1)
+        fig.update_yaxes(title_text="RSI", range=[0, 100], row=2, col=1)
+        
+        # Finalize layout
+        _finalize_subplots(fig, nrows=2, bottom_x_title="Date")
+        
         # Update layout
         fig.update_layout(
             title=f"{symbol} - RSI Analysis",
-            xaxis_title="Date",
             height=500,
             showlegend=True,
-            template="plotly_white"
+            template="plotly_white",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
         )
-        
-        # Set y-axis ranges
-        fig.update_yaxes(title_text="Price ($)", row=1, col=1)
-        fig.update_yaxes(title_text="RSI", range=[0, 100], row=2, col=1)
         
         logger.info(f"Created RSI chart for {symbol}")
         return fig
@@ -294,8 +354,7 @@ def drawdown_chart(symbol: str) -> Optional[Any]:
         fig = make_subplots(
             rows=2, cols=1,
             shared_xaxes=True,
-            vertical_spacing=0.1,
-            subplot_titles=(f"{symbol} Price", "Drawdown"),
+            vertical_spacing=0.10,
             row_width=[0.7, 0.3]
         )
         
@@ -322,18 +381,25 @@ def drawdown_chart(symbol: str) -> Optional[Any]:
             row=2, col=1
         )
         
+        # Add panel captions
+        _panel_caption(fig, row=1, text=f"{symbol} Price")
+        _panel_caption(fig, row=2, text="Drawdown")
+        
+        # Set y-axis titles
+        fig.update_yaxes(title_text="Price ($)", row=1, col=1)
+        fig.update_yaxes(title_text="Drawdown (%)", row=2, col=1)
+        
+        # Finalize layout
+        _finalize_subplots(fig, nrows=2, bottom_x_title="Date")
+        
         # Update layout
         fig.update_layout(
             title=f"{symbol} - Drawdown Analysis",
-            xaxis_title="Date",
             height=500,
             showlegend=True,
-            template="plotly_white"
+            template="plotly_white",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
         )
-        
-        # Set y-axis ranges
-        fig.update_yaxes(title_text="Price ($)", row=1, col=1)
-        fig.update_yaxes(title_text="Drawdown (%)", row=2, col=1)
         
         logger.info(f"Created drawdown chart for {symbol}")
         return fig
@@ -372,8 +438,7 @@ def macd_chart(symbol: str) -> Optional[Any]:
         fig = make_subplots(
             rows=2, cols=1,
             shared_xaxes=True,
-            vertical_spacing=0.1,
-            subplot_titles=(f"{symbol} Price", "MACD"),
+            vertical_spacing=0.10,
             row_width=[0.7, 0.3]
         )
         
@@ -425,18 +490,25 @@ def macd_chart(symbol: str) -> Optional[Any]:
                 row=2, col=1
             )
         
+        # Add panel captions
+        _panel_caption(fig, row=1, text=f"{symbol} Price")
+        _panel_caption(fig, row=2, text="MACD")
+        
+        # Set y-axis titles
+        fig.update_yaxes(title_text="Price ($)", row=1, col=1)
+        fig.update_yaxes(title_text="MACD", row=2, col=1)
+        
+        # Finalize layout
+        _finalize_subplots(fig, nrows=2, bottom_x_title="Date")
+        
         # Update layout
         fig.update_layout(
             title=f"{symbol} - MACD Analysis",
-            xaxis_title="Date",
             height=500,
             showlegend=True,
-            template="plotly_white"
+            template="plotly_white",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
         )
-        
-        # Set y-axis ranges
-        fig.update_yaxes(title_text="Price ($)", row=1, col=1)
-        fig.update_yaxes(title_text="MACD", row=2, col=1)
         
         logger.info(f"Created MACD chart for {symbol}")
         return fig

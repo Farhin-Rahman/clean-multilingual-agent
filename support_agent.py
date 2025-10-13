@@ -101,6 +101,7 @@ YF_MAX_SYMBOLS = int(os.getenv("YF_MAX_SYMBOLS", "8"))  # keep small to avoid th
 SP500_CACHE_FILE = "sp500_cache.csv"
 SP500_CACHE_TTL_HOURS = 24
 SP500_FULL_CACHE_FILE = "sp500_full_cache.csv"
+LOCAL_SP500 = "data/sp500_symbols.csv"
 
 # ---- Performance budget knob (added) ----
 AGENT_BUDGET_MS = int(os.getenv("AGENT_BUDGET_MS", "1200"))
@@ -512,6 +513,18 @@ def get_real_stock_data_parallel(symbols: List[str]) -> List[Dict[str, Any]]:
             mcap = meta.get("marketCap", 0.0)
             dy = meta.get("dividendYield", None)
 
+            # Backfill sector from cached S&P500 table if missing or Unknown
+            try:
+                if sector in (None, "", "Unknown"):
+                    spx = get_sp500_table_cached()
+                    sym_upper = sym.upper()
+                    row = spx.loc[spx["Symbol"].str.upper() == sym_upper]
+                    if not row.empty:
+                        sector = f"{row.iloc[0].get('Sector', 'Unknown')}"
+                        meta.setdefault("sector", sector)
+            except Exception:
+                pass
+
             out.append({
                 "name": meta.get("longName", sym),
                 "symbol": sym,
@@ -555,6 +568,13 @@ def normalize_company_keys(c: dict) -> dict:
 
 # --------------------------- Sector prefilter -----------------------------
 def get_sp500_tickers() -> List[str]:
+    # 0) local repo fallback
+    try:
+        if os.path.exists(LOCAL_SP500):
+            return pd.read_csv(LOCAL_SP500)["Symbol"].astype(str).str.replace(".", "-", regex=False).tolist()
+    except Exception:
+        pass
+    # 1) cached file
     try:
         if os.path.exists(SP500_CACHE_FILE):
             age = time.time() - os.path.getmtime(SP500_CACHE_FILE)
@@ -571,9 +591,21 @@ def get_sp500_tickers() -> List[str]:
             return pd.read_csv(SP500_CACHE_FILE)["Symbol"].tolist()
         except Exception:
             pass
+    # 2) last-ditch simple fallback
     return ["AAPL","MSFT","GOOGL","AMZN","TSLA","META","NVDA","JPM","JNJ","V"]
 
 def get_sp500_table_cached() -> pd.DataFrame:
+    # 0) local repo fallback
+    try:
+        if os.path.exists(LOCAL_SP500):
+            df = pd.read_csv(LOCAL_SP500)
+            if "Sector" not in df.columns:
+                df["Sector"] = "Unknown"
+            df["Symbol"] = df["Symbol"].astype(str).str.replace(".", "-", regex=False)
+            return df[["Symbol","Sector"]]
+    except Exception:
+        pass
+    # 1) cached full table or live
     try:
         if os.path.exists(SP500_FULL_CACHE_FILE):
             age = time.time() - os.path.getmtime(SP500_FULL_CACHE_FILE)
@@ -593,6 +625,7 @@ def get_sp500_table_cached() -> pd.DataFrame:
             return pd.read_csv(SP500_FULL_CACHE_FILE)
         except Exception:
             pass
+    # 2) fallback build
     tickers = get_sp500_tickers()
     return pd.DataFrame({"Symbol": tickers, "Sector": ["Unknown"] * len(tickers)})
 
@@ -757,33 +790,63 @@ def get_translator(source_lang: str, target_lang: str):
         return None
 
 def translate_input_to_english(text: str) -> tuple[str, str]:
+    # Detect first (best effort)
     if detect is None:
         return text, "en"
     try:
-        detected_lang = detect(text)
-        if detected_lang == "en":
-            return text, "en"
-        elif detected_lang in SUPPORTED_LANGUAGES:
+        detected_lang = detect(text) or "en"
+    except Exception as e:
+        logger.warning(f"Language detection failed: {e}")
+        detected_lang = "en"
+
+    if detected_lang == "en":
+        return text, "en"
+
+    # 1) transformers path if available
+    try:
+        if detected_lang in SUPPORTED_LANGUAGES:
             translator = get_translator(detected_lang, "en")
             if translator:
                 translated = translator(text, max_length=512)[0]["translation_text"]
                 return translated, detected_lang
-        return text, "en"
     except Exception as e:
-        logger.warning(f"Translation failed: {e}")
-        return text, "en"
+        logger.warning(f"Helsinki translation failed: {e}")
+
+    # 2) LLM fallback translation via your routing layer
+    try:
+        prompt = (
+            f"Translate the following to English. Keep markdown, numbers and tickers unchanged.\n\n{text}"
+        )
+        translated = chat([{"role": "user", "content": prompt}])
+        return (translated or text), detected_lang
+    except Exception as e:
+        logger.warning(f"LLM fallback translation failed: {e}")
+        return text, detected_lang
 
 def translate_output_from_english(text: str, target_lang: str) -> str:
-    if target_lang == "en":
+    if target_lang in (None, "", "en"):
         return text
+
+    # 1) transformers path if available
     try:
         translator = get_translator("en", target_lang)
         if translator:
-            translated = translator(text, max_length=512)[0]["translation_text"]
+            translated = translator(text, max_length=1024)[0]["translation_text"]
             return translated
     except Exception as e:
-        logger.warning(f"Output translation failed: {e}")
-    return text
+        logger.warning(f"Helsinki output translation failed: {e}")
+
+    # 2) LLM fallback translation via your routing layer
+    try:
+        lang_name = SUPPORTED_LANGUAGES.get(target_lang, target_lang)
+        prompt = (
+            f"Translate the following into {lang_name}. Keep markdown, numbers, and tickers unchanged.\n\n{text}"
+        )
+        translated = chat([{"role": "user", "content": prompt}])
+        return translated or text
+    except Exception as e:
+        logger.warning(f"LLM fallback output translation failed: {e}")
+        return text
 
 # --------------------------- PDF / Web helpers ---------------------------
 def extract_text_from_pdf(file_path: str) -> str:
@@ -1002,7 +1065,21 @@ Return queries fenced in sql blocks.
         sql_queries = re.findall(r"```sql\s*(.*?)```", content, re.DOTALL | re.IGNORECASE)
         if not sql_queries:
             sql_queries = ["SELECT * FROM companies ORDER BY market_cap DESC LIMIT 10"]
-        state["sql_queries"] = sql_queries[:3]
+        
+        # NEW: normalize into single-select strings
+        single_selects = []
+        for block in sql_queries:
+            # Drop anything after a second SELECT (LLMs sometimes stack)
+            parts = re.split(r"(?i)\bSELECT\b", block)
+            if not parts:
+                continue
+            # Rebuild first SELECT
+            first_select = "SELECT" + parts[1] if len(parts) > 1 else block
+            # terminate at the next SELECT if present in the remainder
+            first_select = re.split(r"(?i)\bSELECT\b", first_select)[0]
+            single_selects.append(first_select.strip())
+        
+        state["sql_queries"] = (single_selects or ["SELECT * FROM companies ORDER BY market_cap DESC LIMIT 10"])[:3]
     except Exception as e:
         logger.error(f"SQL generation failed: {e}")
         state["sql_queries"] = ["SELECT * FROM companies ORDER BY market_cap DESC LIMIT 10"]
@@ -1219,6 +1296,13 @@ def validate_recommendations(items: List[dict]) -> List[dict]:
             continue
     return out
 
+def _fmt_dy(dy):
+    if not isinstance(dy, (int, float)) or dy <= 0:
+        return "—"
+    pct = dy*100 if dy < 1 else dy
+    pct = max(0.0, min(pct, 20.0))  # clamp absurd values
+    return f"{pct:.1f}%"
+
 def _defensive_reason(c: dict) -> str:
     bits=[]
     if (c.get("beta") or 1.0) < 1.0: bits.append("below-market β")
@@ -1283,24 +1367,92 @@ def recommendation_agent(state: FinancialAgentState):
     ranked.sort(key=lambda x: (x["score"], x["confidence"]), reverse=True)
     top = ranked[:3]
 
-    # Friendly, investor-style rendering (no heavy scaffolding)
-    lines = [f"### Safe stock suggestions ({risk_label})", ""]
-    for r in top:
-        cap = r.get("market_cap") or 0
-        cap_str = f"${cap/1e9:.0f}B" if cap else "—"
-        pe = r.get("pe_ratio")
-        pe_str = f"{pe:.1f}x" if isinstance(pe,(int,float)) and pe>0 else "—"
-        dy = r.get("dividend_yield")
-        dy_str = f"{dy*100:.1f}%" if isinstance(dy,(int,float)) and dy>0 else "—"
-        beta = r.get("beta") or 1.0
-        sigma20d = (r.get("volatility") or 0.0) * math.sqrt(20/252) * 100.0
+    # Check if academic mode
+    style = (state.get("user_requirements", {}) or {}).get("style")
+    need_primary = (state.get("user_requirements", {}) or {}).get("require_primary_sources", False) or style == "academic"
 
-        lines.append(f"    {r['company']} ({r['symbol']}) — ${r['price']:.2f} · score {r['score']:.3f} · conf {r['confidence']:.2f}")
-        lines.append(f"        Profile: {r.get('sector','—')} • β≈{beta:.2f} • DY≈{dy_str}")
-        lines.append(f"        Valuation: P/E≈{pe_str} • Cap≈{cap_str}")
-        lines.append(f"        Momentum & risk: RSI {r.get('rsi',50)} • Trend {r.get('trend','—')} • σ20d≈{sigma20d:.1f}%")
-        lines.append(f"        Why it screens as defensive: {_defensive_reason(r)}")
-        lines.append("")  # blank line between entries
+    def _primary_sources_for(sym: str, existing_sources: list) -> list:
+        prim = [s for s in existing_sources if "sec.gov" in (s.get("url","").lower())]
+        if len(prim) < 2:
+            try:
+                filings = latest_filings_for_ticker(sym, limit=3) or []
+                for f in filings:
+                    prim.append({"title": f"{f.get('form','Filing')} {f.get('filing_date','')}",
+                                 "url": f.get('url',''), "date": f.get('filing_date','')})
+            except Exception:
+                pass
+        # dedupe and take top 2-3
+        seen = set(); out = []
+        for s in prim:
+            u = s.get("url","")
+            if u and u not in seen:
+                out.append(s); seen.add(u)
+            if len(out) >= 3:
+                break
+        return out
+
+    if need_primary:
+        # Academic rendering with Assumptions/Limitations/Sources
+        lines = [f"### Safe stock suggestions ({risk_label})", ""]
+        # global blocks
+        weights_str = ", ".join([f"{k}={int(v*100)}%" for k,v in weights.items()])
+        lines.append("**Assumptions**")
+        lines.append(f"- Screening uses MCDM weights: {weights_str}.")
+        lines.append("- Momentum proxy: price vs SMA-20 and RSI band; Risk proxy: β and annualized vol from returns.")
+        lines.append("- Universe: S&P-500 derived candidates (robust fallback if live fetch fails).")
+        lines.append("")
+        lines.append("**Limitations**")
+        lines.append("- This is not investment advice; no price targets. Data may be delayed or incomplete.")
+        lines.append("- Headlines sentiment is a proxy and can be noisy. Fundamental fields may use fallbacks.")
+        lines.append("")
+        
+        # Per-pick details with sources
+        for r in top:
+            cap = r.get("market_cap") or 0
+            cap_str = f"${cap/1e9:.0f}B" if cap else "—"
+            pe = r.get("pe_ratio")
+            pe_str = f"{pe:.1f}x" if isinstance(pe,(int,float)) and pe>0 else "—"
+            dy_str = _fmt_dy(r.get("dividend_yield"))
+            beta = r.get("beta") or 1.0
+            sigma20d = (r.get("volatility") or 0.0) * math.sqrt(20/252) * 100.0
+
+            lines.append(f"**{r['company']} ({r['symbol']})** — ${r['price']:.2f} · score {r['score']:.3f} · conf {r['confidence']:.2f}")
+            lines.append(f"- Profile: {r.get('sector','—')} • β≈{beta:.2f} • DY≈{dy_str}")
+            lines.append(f"- Valuation: P/E≈{pe_str} • Cap≈{cap_str}")
+            lines.append(f"- Momentum & risk: RSI {r.get('rsi',50)} • Trend {r.get('trend','—')} • σ20d≈{sigma20d:.1f}%")
+            lines.append(f"- Why defensive: {_defensive_reason(r)}")
+            
+            # Sources
+            all_src = r.get("sources", [])
+            prim = _primary_sources_for(r["symbol"], all_src) if need_primary else []
+            if prim or all_src:
+                lines.append("- **Sources:**")
+                # Prefer primaries; if none, show up to 2 mixed
+                show = prim if prim else all_src[:2]
+                for s in show:
+                    title = s.get("title","Source")
+                    url = s.get("url","")
+                    if url:
+                        lines.append(f"  - {title} — {url}")
+            lines.append("")  # spacing
+    else:
+        # Friendly, investor-style rendering (no heavy scaffolding)
+        lines = [f"### Safe stock suggestions ({risk_label})", ""]
+        for r in top:
+            cap = r.get("market_cap") or 0
+            cap_str = f"${cap/1e9:.0f}B" if cap else "—"
+            pe = r.get("pe_ratio")
+            pe_str = f"{pe:.1f}x" if isinstance(pe,(int,float)) and pe>0 else "—"
+            dy_str = _fmt_dy(r.get("dividend_yield"))
+            beta = r.get("beta") or 1.0
+            sigma20d = (r.get("volatility") or 0.0) * math.sqrt(20/252) * 100.0
+
+            lines.append(f"    {r['company']} ({r['symbol']}) — ${r['price']:.2f} · score {r['score']:.3f} · conf {r['confidence']:.2f}")
+            lines.append(f"        Profile: {r.get('sector','—')} • β≈{beta:.2f} • DY≈{dy_str}")
+            lines.append(f"        Valuation: P/E≈{pe_str} • Cap≈{cap_str}")
+            lines.append(f"        Momentum & risk: RSI {r.get('rsi',50)} • Trend {r.get('trend','—')} • σ20d≈{sigma20d:.1f}%")
+            lines.append(f"        Why it screens as defensive: {_defensive_reason(r)}")
+            lines.append("")  # blank line between entries
 
     state["recommendations"] = top
     state["final_response"] = "\n".join(lines).rstrip()
@@ -1429,6 +1581,7 @@ def run_customer_support(
     attachments_sources: Optional[List] = None,
     routing_override: Optional[str] = None,
     high_fidelity: bool = False,
+    use_attachments: bool = False,
 ) -> Dict[str, Any]:
     if chat_history is None: chat_history = []
     if user_profile is None: user_profile = {}
@@ -1480,20 +1633,16 @@ def run_customer_support(
             filings = latest_filings_for_ticker(tickers[0], limit=5)
             if filings:
                 result["explainability"]["filings"] = filings
-    # ---- Attachment intent override (vision-first) ----
+    # ---- Attachment context (opt-in) ----
     attachment_context = ""
-    has_attachments = bool(attachments_index and getattr(attachments_index, "is_built", False))
-    IMAGE_WORDS = ("image","photo","picture","screenshot","diagram","chart","scan","slide","attachment","file","document")
+    has_index = bool(attachments_index and getattr(attachments_index, "is_built", False))
+    IMAGE_WORDS = ("image","photo","picture","screenshot","diagram","chart","scan","slide","attachment","file","document","pdf")
+    mentions_attachment = any(w in query.lower() for w in IMAGE_WORDS)
 
-    logger.info(f"[routing] intent(before)={intent} has_attachments={has_attachments}")
-
-    if has_attachments:
+    # Only pull attachment text if the user opted-in OR explicitly mentioned an attachment
+    if has_index and (use_attachments or mentions_attachment):
         try:
-            # If the user mentions an image/file, force general (vision) intent
-            if any(w in translated_query.lower() for w in IMAGE_WORDS):
-                intent = "general_query"
-            # Always pull attachment text so we can include it later
-            q_for_attach = translated_query.strip() or "describe the image"
+            q_for_attach = query.strip() or "describe the image"
             attachment_hits = attachments_index.query(q_for_attach, k=5)
             if attachment_hits:
                 attachment_context = "\n\nAttachment Context:\n" + "\n".join(
@@ -1503,7 +1652,9 @@ def run_customer_support(
         except Exception as e:
             logger.warning(f"Attachment query failed: {e}")
 
-    logger.info(f"[routing] intent(after)={intent} attach_ctx_len={len(attachment_context)}")
+    # Do NOT switch intent just because attachments exist. Only switch if the user mentioned them.
+    if mentions_attachment:
+        intent = "general_query"
 
 
     if intent == "add_to_portfolio":
@@ -1527,26 +1678,6 @@ def run_customer_support(
         response = format_portfolio_response(performance_data)
 
     elif intent == "financial_analysis":
-        # Check for attachment context  🔁 REPLACE THIS WHOLE BLOCK
-        attachment_context = ""
-        has_attachments = bool(attachments_index and getattr(attachments_index, "is_built", False))
-        image_words = ("image","photo","picture","screenshot","diagram","chart","attachment","file","document")
-        if has_attachments:
-            try:
-                if any(w in translated_query.lower() for w in image_words):
-                    intent = "general_query"
-                    
-                q_for_attach = translated_query.strip() or "describe the image"
-                attachment_results = attachments_index.query(q_for_attach, k=5)
-                if attachment_results:
-                    attachment_context = "\n\nAttachment Context:\n" + "\n".join(
-                        [f"- {text[:400]}..." for text, score in attachment_results]
-                    )
-                    result["explainability"]["attachment_sources"] = len(attachment_results)
-            except Exception as e:
-                logger.warning(f"Attachment query failed: {e}")
-
-        
         # Determine LLM routing mode
         mode = routing_override or routing_mode()
         use_consensus = should_use_consensus(high_fidelity)
@@ -1567,6 +1698,11 @@ def run_customer_support(
         try:
             workflow_result = workflow.invoke(initial_state)
             base_response = workflow_result.get("final_response", "Analysis complete, but no response was generated.")
+            
+            # If academic style, auto-show charts for the top picks
+            picks = workflow_result.get("recommendations", [])
+            if picks and (user_requirements.get("style") == "academic" or user_requirements.get("require_primary_sources")):
+                result["charts"] = [p.get("symbol") for p in picks[:3] if p.get("symbol")]
             
             # Apply LLM routing if needed
             if use_consensus and mode == "consensus":

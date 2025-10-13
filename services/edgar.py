@@ -12,18 +12,21 @@ logger = logging.getLogger(__name__)
 
 # SEC EDGAR API configuration
 SEC_BASE_URL = "https://www.sec.gov"
+SEC_DATA_BASE_URL = "https://data.sec.gov"
 SEC_USER_AGENT = os.getenv("SEC_USER_AGENT", "FinancialAssistant/1.0 (contact@example.com)")
 if not os.getenv("SEC_USER_AGENT"):
     logger.warning("SEC_USER_AGENT not set, using default. Set SEC_USER_AGENT='Your Name your@email' for SEC API access")
-SEC_HEADERS = {"User-Agent": SEC_USER_AGENT}
+SEC_HEADERS = {
+    "User-Agent": SEC_USER_AGENT,
+    "Accept-Encoding": "gzip, deflate"
+}
 
 class EdgarClient:
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update({
             **SEC_HEADERS,
-            "Accept": "application/json",
-            "Host": "www.sec.gov"
+            "Accept": "application/json"
         })
         self.timeout = 30
         self.rate_limit_delay = 0.2  # 200ms delay between requests
@@ -99,7 +102,7 @@ class EdgarClient:
             return []
         
         try:
-            url = f"{SEC_BASE_URL}/data/edgar/submissions/CIK{cik}.json"
+            url = f"{SEC_DATA_BASE_URL}/submissions/CIK{cik}.json"
             data = self._make_request(url)
             
             if not data or "filings" not in data:
