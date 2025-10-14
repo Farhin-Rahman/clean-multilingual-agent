@@ -740,7 +740,9 @@ with col2:
             # ----- Decide if we use attachments for this message -----
             IMAGE_WORDS = ("image","photo","picture","screenshot","diagram","chart","scan","slide","attachment","file","document","pdf")
             mentions_attachment = any(w in query.lower() for w in IMAGE_WORDS)
-            use_attachments_now = bool(st.session_state.get("use_attachments_next", False)) or mentions_attachment
+            _attach_flag = bool(st.session_state.get("use_attachments_next", False))
+            _attach_consumed = bool(st.session_state.get("use_attachments_consumed", False))
+            use_attachments_now = (_attach_flag and not _attach_consumed) or mentions_attachment
 
             # ----- Attachment processing (only if opted-in) -----
             attachments_index = None
