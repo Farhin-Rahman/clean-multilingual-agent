@@ -883,7 +883,7 @@ with col2:
                             st.write(f"- {filing.get('form', 'N/A')} ({filing.get('filing_date', 'N/A')})")
 
             # mark the one-shot checkbox as consumed without modifying the widget value directly
-            if _attach_flag:
+            if bool(st.session_state.get("use_attachments_next", False)):
                 st.session_state["use_attachments_consumed"] = True
             st.session_state.clear_query = True
             st.rerun()
