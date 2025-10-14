@@ -37,8 +37,8 @@ def ocr_image(path: str) -> str:
         logger.warning("pytesseract path/method unavailable: %s", e)
 
     # --- Fallback: OCR.Space ---
-    key = (st.secrets.get("OCR_SPACE_API_KEY")
-           if hasattr(st, "secrets") else None) or os.getenv("OCR_SPACE_API_KEY")
+    # Avoid accessing st.secrets here to prevent errors when no secrets.toml exists
+    key = os.getenv("OCR_SPACE_API_KEY")
     if key:
         try:
             with open(path, "rb") as f:

@@ -1486,15 +1486,38 @@ def create_financial_workflow():
 # --------------------------- Intent & formatting --------------------------
 def is_financial_query(query: str) -> bool:
     q = query.lower()
-    financial_keywords = ["stock","portfolio","market","buy","sell","recommendation","risk","return","shares","p/e","market cap","dividend","investment","ticker"]
-    if any(k in q for k in financial_keywords): return True
-    if re.search(r"\b[A-Z]{1,5}\b", query): return True
+    # News / recap style queries should NOT trigger the financial screening agent
+    news_like = any(w in q for w in [
+        "what changed", "headline", "headlines", "news", "summarize",
+        "recap", "in one line", "cite", "source"
+    ])
+    if news_like:
+        return False
+
+    financial_keywords = ["stock","portfolio","market","buy","sell","recommendation",
+                          "risk","return","shares","p/e","market cap","dividend",
+                          "investment","ticker"]
+    # Normal finance cues
+    if any(k in q for k in financial_keywords):
+        return True
+
+    # Only treat bare tickers as financial if there are finance cues too
+    if re.search(r"\b[A-Z]{1,5}\b", query):
+        return any(k in q for k in financial_keywords)
+
     if "company" in q or "safe" in q:
         return any(k in q for k in ["stock","investment","p/e","market"])
     return False
 
 def detect_intent(query: str) -> str:
     q = query.lower()
+    # Route news-like prompts to general QA first
+    if any(w in q for w in [
+        "what changed", "headline", "headlines", "news", "summarize",
+        "recap", "in one line", "cite", "source"
+    ]):
+        return "general_query"
+
     if any(w in q for w in ["buy","add","purchase"]):
         if re.search(r"buy\s+([\d.,]+)\s+shares?\s+of\s+([A-Za-z.\-]{1,7})", query, re.IGNORECASE):
             return "add_to_portfolio"
@@ -1531,7 +1554,7 @@ def validate_query(query: str) -> str:
     return q
 
 def handle_general_query_with_search(query: str, context: str, chat_history: List[Dict[str, str]], file_path: Optional[str] = None) -> str:
-    should_search = any(k in query.lower() for k in ["company","startup","recent","news","current","today","latest","what is","who is","tell me about"])
+    should_search = any(k in query.lower() for k in ["company","startup","recent","news","current","today","latest","what is","who is","what changed","headline","summarize","recap"])
     web_results = web_search_ddg(query, max_results=3) if should_search else ""
     history_text = "\n".join(f"User: {m['user']}\nAgent: {m['agent']}" for m in chat_history[-3:])
     file_summary = extract_text_from_pdf(file_path) if file_path else ""
@@ -1541,6 +1564,13 @@ def handle_general_query_with_search(query: str, context: str, chat_history: Lis
     file_str = f"File content summary:\n{file_summary}\n" if file_summary else ""
     web_str = f"Current web search results:\n{web_results}\n" if web_results else ""
 
+    ql = query.lower()
+    wants_one_line = "in one line" in ql or "one line" in ql
+    wants_cite = "cite" in ql or "source" in ql
+
+    citing_instr = "Include exactly one source URL." if wants_cite else "Include a source if available."
+    brevity_instr = "Answer in exactly one sentence." if wants_one_line else "Answer concisely."
+
     prompt = f"""
 You are a helpful AI assistant. Provide clear, accurate responses grounded in sources if given.
 
@@ -1548,9 +1578,11 @@ You are a helpful AI assistant. Provide clear, accurate responses grounded in so
 User's question: {query}
 
 Instructions:
+- Use search results if available and cite with URLs.
+- {brevity_instr}
+- {citing_instr}
+- Be direct and avoid stock screening; this is a news/recap-style question if applicable.
 
-Use search results if available and cite with URLs.
-Be direct and concise.
 Answer:
 """.strip()
     try:
