@@ -500,6 +500,10 @@ if "user_id" not in st.session_state:
 if "use_attachments_next" not in st.session_state:
     st.session_state.use_attachments_next = False
 
+# Internal one-shot consumption flag for attachments checkbox
+if "use_attachments_consumed" not in st.session_state:
+    st.session_state.use_attachments_consumed = False
+
 # NEW: persist last charts/symbols that should render on every rerun
 if "last_charts" not in st.session_state:
     st.session_state.last_charts = []
@@ -878,8 +882,9 @@ with col2:
                         for filing in explainability["filings"][:3]:
                             st.write(f"- {filing.get('form', 'N/A')} ({filing.get('filing_date', 'N/A')})")
 
-            # turn off so attachments don't "stick"
-            st.session_state.use_attachments_next = False
+            # mark the one-shot checkbox as consumed without modifying the widget value directly
+            if _attach_flag:
+                st.session_state["use_attachments_consumed"] = True
             st.session_state.clear_query = True
             st.rerun()
 
